@@ -1,0 +1,15 @@
+{
+  "_comentario": "Ejemplo de cómo registrar este servidor MCP local en Claude Code o Claude Desktop. Ajusta las rutas y variables según tu entorno. Verifica el formato exacto vigente en la documentación oficial (docs.claude.com), ya que puede cambiar.",
+  "mcpServers": {
+    "datadog-aws-integration": {
+      "command": "python",
+      "args": ["/ruta/absoluta/a/datadog-aws-mcp/server.py"],
+      "env": {
+        "DD_API_KEY": "tu_api_key",
+        "DD_APP_KEY": "tu_app_key",
+        "DD_SITE": "datadoghq.com",
+        "AWS_REGION": "us-east-1"
+      }
+    }
+  }
+}
