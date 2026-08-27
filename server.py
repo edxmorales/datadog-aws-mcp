@@ -1,34 +1,47 @@
 """
-Servidor MCP: integración con Datadog, AWS CloudWatch/Logs y (opcional)
-Azure Repos.
+Servidor MCP: integración con Datadog, AWS CloudWatch/Logs, Azure Repos
+y GitHub — TODAS las fuentes son independientes y opcionales.
 
 Expone herramientas que Claude (vía Claude Code, la API con mcp_servers,
 o Claude Desktop) puede usar para:
-  - Consultar errores/monitores disparados en Datadog.
-  - Consultar logs de error en CloudWatch.
-  - Agrupar/detectar errores recurrentes (misma huella / fingerprint).
-  - Leer código fuente de repos alojados en Azure Repos (Azure DevOps),
-    para diagnosticar errores cuyo código vive ahí en vez de GitHub.
+  - Consultar errores/monitores disparados en Datadog (opcional).
+  - Consultar logs de error en CloudWatch (opcional).
+  - Agrupar/detectar errores recurrentes (misma huella / fingerprint)
+    combinando las fuentes que estén configuradas.
+  - Leer código fuente de repos en Azure Repos (opcional) o GitHub
+    (opcional), para diagnosticar errores antes de proponer un fix.
+
+DISEÑO "TODO OPCIONAL, TODO COMBINABLE":
+  No hace falta tener las 4 fuentes configuradas. Cada una se activa
+  independientemente según qué variables de entorno definas — puedes
+  usar solo AWS, solo Datadog, solo GitHub, AWS+GitHub, AWS+Datadog,
+  las 4 juntas, etc. Si una fuente no está configurada:
+    - Sus herramientas individuales (ej. datadog_recent_errors,
+      azure_repos_get_file) devuelven un RuntimeError explicando
+      exactamente qué variable falta, en vez de fallar de forma confusa.
+    - find_recurring_errors simplemente omite esa fuente (lo reporta en
+      "skipped_sources" de su respuesta) en vez de fallar por completo.
 
 IMPORTANTE (seguridad):
   - Las credenciales se leen de variables de entorno, nunca hardcodeadas.
-  - El rol IAM, las API keys de Datadog y el PAT de Azure DevOps usados
-    aquí deben tener SOLO permisos de lectura (CloudWatch Logs read-only,
-    Datadog read-only, Azure DevOps "Code (Read)"). Este servidor NO
-    expone herramientas de escritura/despliegue a propósito: esa parte
-    (crear rama, hacer commit, abrir PR, deploy) se recomienda dejarla en
-    manos de Claude Code usando git/gh directamente, con revisión humana
-    antes de mergear o desplegar.
+  - El rol IAM, las API keys de Datadog, el PAT de Azure DevOps y el
+    token de GitHub usados aquí deben tener SOLO permisos de lectura
+    (CloudWatch Logs read-only, Datadog read-only, Azure DevOps
+    "Code (Read)", GitHub fine-grained "Contents: Read-only"). Este
+    servidor NO expone herramientas de escritura/despliegue a propósito:
+    esa parte (crear rama, hacer commit, abrir PR, deploy) se recomienda
+    dejarla en manos de Claude Code usando git/gh directamente, con
+    revisión humana antes de mergear o desplegar.
 
 Requisitos:
     pip install mcp boto3 httpx python-dotenv --break-system-packages
 
-Variables de entorno esperadas (ver .env.example):
-    DD_API_KEY, DD_APP_KEY, DD_SITE (por defecto datadoghq.com)
-    AWS_REGION (usa las credenciales estándar de AWS: perfil, rol, etc.)
-    AZURE_DEVOPS_ORG, AZURE_DEVOPS_PAT (opcionales — solo si tu código
-        fuente vive en Azure Repos; si no se configuran, las herramientas
-        de Azure simplemente devuelven un error explicando qué falta)
+Variables de entorno esperadas (ver .env.example) — TODAS opcionales
+salvo que quieras usar esa fuente en particular:
+    DD_API_KEY, DD_APP_KEY, DD_SITE (Datadog; por defecto datadoghq.com)
+    AWS_REGION (AWS; usa las credenciales estándar: perfil, rol, env vars)
+    AZURE_DEVOPS_ORG, AZURE_DEVOPS_PAT (Azure Repos)
+    GITHUB_TOKEN, GITHUB_API_URL (GitHub; sin token solo ve repos públicos)
 """
 
 import base64
@@ -43,23 +56,34 @@ from typing import Optional
 
 import httpx
 import boto3
+from botocore.exceptions import BotoCoreError, ClientError
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 
 load_dotenv()
 
+# --- Datadog (opcional) ---
 DD_API_KEY = os.environ.get("DD_API_KEY", "")
 DD_APP_KEY = os.environ.get("DD_APP_KEY", "")
 DD_SITE = os.environ.get("DD_SITE", "datadoghq.com")
+
+# --- AWS CloudWatch (opcional) ---
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 
-# Azure Repos (Azure DevOps) es opcional: solo hace falta si el código
-# fuente que quieres que Claude lea vive ahí. Genérico a propósito — no
-# asume una organización/proyecto/repo fijo, para que cualquiera pueda
-# apuntarlo a su propia cuenta de Azure DevOps vía .env.
+# --- Azure Repos / Azure DevOps (opcional) ---
+# Genérico a propósito: no asume una organización/proyecto/repo fijo,
+# para que cualquiera pueda apuntarlo a su propia cuenta vía .env.
 AZURE_DEVOPS_ORG = os.environ.get("AZURE_DEVOPS_ORG", "")
 AZURE_DEVOPS_PAT = os.environ.get("AZURE_DEVOPS_PAT", "")
 AZURE_DEVOPS_API_VERSION = os.environ.get("AZURE_DEVOPS_API_VERSION", "7.1")
+
+# --- GitHub (opcional) ---
+# Igual de genérico: sin GITHUB_TOKEN, las herramientas de solo-lectura
+# de contenido funcionan igual pero limitadas a repos públicos y con
+# límites de rate más bajos. Con un token (fine-grained, "Contents:
+# Read-only") también ves repos privados a los que tengas acceso.
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_API_URL = os.environ.get("GITHUB_API_URL", "https://api.github.com")
 
 # Archivo local donde se guarda el historial de incidentes ya diagnosticados
 # y resueltos. Esto es lo que le da al agente "memoria" de casos pasados,
@@ -109,6 +133,52 @@ def _dd_headers() -> dict:
     }
 
 
+def _cloudwatch_client():
+    """Crea el cliente de boto3 para CloudWatch Logs, traduciendo errores
+    de credenciales/permisos a un mensaje claro (AWS es una fuente
+    opcional — boto3 por sí solo da errores crípticos como "Unable to
+    locate credentials" que no dicen qué hacer al respecto).
+    """
+    try:
+        client = boto3.client("logs", region_name=AWS_REGION)
+        # boto3 no valida credenciales al crear el cliente; forzamos una
+        # llamada barata para detectar el problema aquí, en un solo lugar.
+        client.describe_log_groups(limit=1)
+        return client
+    except (BotoCoreError, ClientError) as e:
+        raise RuntimeError(
+            "No se pudo conectar a AWS CloudWatch Logs: "
+            f"{e}. Verifica tus credenciales de AWS — vía `aws configure`, "
+            "variables de entorno AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, "
+            "o un rol/perfil — y que AWS_REGION sea la región correcta. "
+            "Nota: si tu Claude Desktop está instalado como app empaquetada "
+            "de Windows, puede no ver tu ~/.aws/credentials — en ese caso "
+            "define AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY directamente en "
+            "el bloque \"env\" de la config del servidor MCP. Esta fuente es "
+            "opcional — si no la necesitas, usa Datadog/Azure Repos/GitHub."
+        ) from e
+
+
+def _require_datadog_config() -> None:
+    if not DD_API_KEY or not DD_APP_KEY:
+        raise RuntimeError(
+            "Datadog no está configurado en este servidor MCP: define "
+            "DD_API_KEY y DD_APP_KEY en tu .env para usar las herramientas "
+            "de Datadog. Esta fuente es opcional — si no la necesitas, "
+            "usa las de AWS/Azure Repos/GitHub en su lugar."
+        )
+
+
+def _github_headers() -> dict:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    return headers
+
+
 def _require_azure_config() -> None:
     if not AZURE_DEVOPS_ORG or not AZURE_DEVOPS_PAT:
         raise RuntimeError(
@@ -141,7 +211,12 @@ def _azure_base_url(project: Optional[str] = None) -> str:
 async def datadog_triggered_monitors() -> str:
     """Lista los monitores de Datadog que están actualmente en estado
     'Alert' o 'Warn'. Útil para saber qué está fallando ahora mismo.
+
+    Requiere DD_API_KEY y DD_APP_KEY configurados en el .env (fuente
+    opcional — si no usas Datadog, usa las herramientas de AWS/Azure
+    Repos/GitHub en su lugar).
     """
+    _require_datadog_config()
     url = f"https://api.{DD_SITE}/api/v1/monitor"
     async with httpx.AsyncClient() as client:
         resp = await client.get(
@@ -172,7 +247,11 @@ async def datadog_recent_errors(query: str = "status:error", hours: int = 1, lim
         query: query de búsqueda de Datadog (ej. "status:error service:checkout").
         hours: ventana de tiempo hacia atrás, en horas.
         limit: máximo de logs a devolver.
+
+    Requiere DD_API_KEY y DD_APP_KEY configurados en el .env (fuente
+    opcional).
     """
+    _require_datadog_config()
     url = f"https://api.{DD_SITE}/api/v2/logs/events/search"
     now_ms = int(time.time() * 1000)
     from_ms = now_ms - hours * 3600 * 1000
@@ -218,8 +297,10 @@ def cloudwatch_recent_errors(log_group: str, hours: int = 1, filter_pattern: str
         log_group: nombre del log group (ej. "/aws/lambda/mi-funcion").
         hours: ventana de tiempo hacia atrás, en horas.
         filter_pattern: patrón de filtro de CloudWatch Logs Insights/Filter.
+
+    Requiere credenciales de AWS configuradas (fuente opcional).
     """
-    client = boto3.client("logs", region_name=AWS_REGION)
+    client = _cloudwatch_client()
     start_time = int((time.time() - hours * 3600) * 1000)
 
     events = []
@@ -251,8 +332,10 @@ def cloudwatch_recent_errors(log_group: str, hours: int = 1, filter_pattern: str
 def cloudwatch_list_log_groups(prefix: Optional[str] = None) -> str:
     """Lista los log groups disponibles en CloudWatch (útil para saber
     qué nombre exacto pasarle a cloudwatch_recent_errors).
+
+    Requiere credenciales de AWS configuradas (fuente opcional).
     """
-    client = boto3.client("logs", region_name=AWS_REGION)
+    client = _cloudwatch_client()
     kwargs = {}
     if prefix:
         kwargs["logGroupNamePrefix"] = prefix
@@ -412,6 +495,137 @@ async def azure_repos_search_code(
 
 
 # ---------------------------------------------------------------------------
+# Herramientas: GitHub — opcional
+# ---------------------------------------------------------------------------
+#
+# Igual de genérico que Azure Repos: sin GITHUB_TOKEN configurado, estas
+# herramientas funcionan igual pero limitadas a repos públicos y con
+# límites de rate más bajos (la API de GitHub lo permite sin auth para
+# lectura de contenido). Con un token (fine-grained, scope de solo
+# lectura "Contents: Read-only") también ves repos privados.
+#
+# No confundas esto con Azure Repos: son dos fuentes de código
+# independientes y ambas opcionales — usa la que corresponda a dónde
+# vive tu código (o ambas, si distintos servicios están en distintos
+# hosts).
+
+@mcp.tool()
+async def github_list_repos(owner: str) -> str:
+    """Lista los repositorios de un usuario o de una organización de GitHub.
+
+    Args:
+        owner: nombre de usuario u organización en GitHub (ej. "octocat").
+
+    Sin GITHUB_TOKEN configurado, solo ve repos públicos. Con un token
+    (fine-grained, "Contents: Read-only"), también ve repos privados a
+    los que ese token tenga acceso.
+    """
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{GITHUB_API_URL}/orgs/{owner}/repos",
+            headers=_github_headers(),
+            params={"per_page": 100},
+        )
+        if resp.status_code >= 400:
+            # No es una organización (o el endpoint de orgs la rechazó por
+            # otra razón, ej. sin auth) — probablemente es un usuario.
+            resp = await client.get(
+                f"{GITHUB_API_URL}/users/{owner}/repos",
+                headers=_github_headers(),
+                params={"per_page": 100},
+            )
+        resp.raise_for_status()
+        data = resp.json()
+
+    repos = [
+        {
+            "name": r["name"],
+            "full_name": r["full_name"],
+            "default_branch": r.get("default_branch"),
+            "private": r.get("private"),
+            "html_url": r.get("html_url"),
+        }
+        for r in data
+    ]
+    return json.dumps(repos, indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+async def github_get_file(owner: str, repo: str, path: str, ref: Optional[str] = None) -> str:
+    """Obtiene el contenido de un archivo de un repo de GitHub.
+
+    Útil para leer el código fuente real al diagnosticar un error (ej.
+    después de find_recurring_errors) cuando el repo vive en GitHub.
+
+    Args:
+        owner: usuario u organización dueño del repo.
+        repo: nombre del repositorio.
+        path: ruta del archivo dentro del repo (ej. "src/checkout/handler.py").
+        ref: rama, tag o commit SHA a consultar (por defecto la rama por
+            defecto del repo).
+    """
+    url = f"{GITHUB_API_URL}/repos/{owner}/{repo}/contents/{path}"
+    params = {"ref": ref} if ref else {}
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, headers=_github_headers(), params=params)
+        resp.raise_for_status()
+        data = resp.json()
+
+    content = data.get("content", "")
+    if data.get("encoding") == "base64" and content:
+        content = base64.b64decode(content).decode("utf-8", errors="replace")
+
+    return json.dumps(
+        {"path": data.get("path", path), "content": content}, indent=2, ensure_ascii=False
+    )
+
+
+@mcp.tool()
+async def github_search_code(
+    search_text: str, owner: Optional[str] = None, repo: Optional[str] = None
+) -> str:
+    """Busca texto/código dentro de repos de GitHub.
+
+    Requiere GITHUB_TOKEN configurado — la Search API de GitHub exige
+    autenticación incluso para repos públicos.
+
+    Args:
+        search_text: texto o snippet de código a buscar.
+        owner: si se indica (y no `repo`), limita la búsqueda a esa
+            organización/usuario.
+        repo: si se indica junto a `owner`, limita la búsqueda a ese repo
+            específico (formato interno: "owner/repo").
+    """
+    if not GITHUB_TOKEN:
+        raise RuntimeError(
+            "github_search_code requiere GITHUB_TOKEN configurado: la "
+            "Search API de GitHub no acepta búsquedas de código sin "
+            "autenticación, ni siquiera en repos públicos. Define "
+            "GITHUB_TOKEN en tu .env (fine-grained, 'Contents: Read-only')."
+        )
+
+    query = search_text
+    if owner and repo:
+        query += f" repo:{owner}/{repo}"
+    elif owner:
+        query += f" org:{owner}"
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{GITHUB_API_URL}/search/code", headers=_github_headers(), params={"q": query}
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    results = [
+        {"file": item.get("path"), "repository": item.get("repository", {}).get("full_name")}
+        for item in data.get("items", [])
+    ]
+    return json.dumps(results, indent=2, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
 # Herramienta combinada: detección de recurrencia
 # ---------------------------------------------------------------------------
 
@@ -422,23 +636,42 @@ async def find_recurring_errors(
     hours: int = 24,
     min_occurrences: int = 3,
 ) -> str:
-    """Combina Datadog + CloudWatch (opcional) y agrupa errores por
-    'fingerprint' para detectar cuáles son recurrentes en la ventana dada.
+    """Combina Datadog + CloudWatch — las fuentes que estén configuradas —
+    y agrupa errores por 'fingerprint' para detectar cuáles son
+    recurrentes en la ventana dada.
+
+    NO requiere tener ambas fuentes configuradas: si Datadog no está
+    configurado, simplemente se omite (igual si no pasas `log_group`, o
+    si AWS no tiene credenciales válidas). La respuesta incluye
+    "skipped_sources" con el detalle de qué se omitió y por qué, para que
+    sepas si el resultado es parcial.
 
     Devuelve solo los grupos de error que ocurrieron min_occurrences veces
     o más, ordenados de más a menos frecuentes. Esto es lo que normalmente
     quieres revisar antes de decidir si vale la pena crear un fix.
     """
     all_messages = []
+    skipped_sources = []
 
-    dd_raw = await datadog_recent_errors(query=datadog_query, hours=hours, limit=500)
-    for item in json.loads(dd_raw):
-        all_messages.append((item["fingerprint"], item["message"], "datadog"))
+    if DD_API_KEY and DD_APP_KEY:
+        try:
+            dd_raw = await datadog_recent_errors(query=datadog_query, hours=hours, limit=500)
+            for item in json.loads(dd_raw):
+                all_messages.append((item["fingerprint"], item["message"], "datadog"))
+        except Exception as e:
+            skipped_sources.append({"source": "datadog", "reason": str(e)})
+    else:
+        skipped_sources.append({"source": "datadog", "reason": "no configurado (DD_API_KEY/DD_APP_KEY)"})
 
     if log_group:
-        cw_raw = cloudwatch_recent_errors(log_group=log_group, hours=hours)
-        for item in json.loads(cw_raw):
-            all_messages.append((item["fingerprint"], item["message"], "cloudwatch"))
+        try:
+            cw_raw = cloudwatch_recent_errors(log_group=log_group, hours=hours)
+            for item in json.loads(cw_raw):
+                all_messages.append((item["fingerprint"], item["message"], "cloudwatch"))
+        except Exception as e:
+            skipped_sources.append({"source": "cloudwatch", "reason": str(e)})
+    else:
+        skipped_sources.append({"source": "cloudwatch", "reason": "no se indicó log_group"})
 
     counter = Counter(fp for fp, _, _ in all_messages)
     examples = {}
@@ -458,7 +691,11 @@ async def find_recurring_errors(
         if count >= min_occurrences
     ]
     recurring.sort(key=lambda x: x["count"], reverse=True)
-    return json.dumps(recurring, indent=2, ensure_ascii=False)
+    return json.dumps(
+        {"recurring": recurring, "skipped_sources": skipped_sources},
+        indent=2,
+        ensure_ascii=False,
+    )
 
 
 # ---------------------------------------------------------------------------

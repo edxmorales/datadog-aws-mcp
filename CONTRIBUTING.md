@@ -43,9 +43,11 @@ dirección del proyecto.
   Sentry).
 - Soporte para otras fuentes de AWS además de CloudWatch Logs (X-Ray,
   RDS Performance Insights).
-- Soporte para otros hosts de código además de Azure Repos (GitLab,
-  Bitbucket) — sigue el mismo patrón genérico vía variables de entorno
-  que ya usan Datadog/AWS/Azure.
+- Soporte para otros hosts de código además de Azure Repos/GitHub
+  (GitLab, Bitbucket) — sigue el mismo patrón: fuente 100% opcional,
+  activada solo por sus propias variables de entorno, con un
+  `_require_*_config()` que da un error claro si falta algo, sin afectar
+  al resto del servidor si no se usa.
 - Un modo "dry-run" que solo reporte sin nunca sugerir cambios de código.
 - Integración con Slack/Discord para notificar cuando se abre un PR
   generado por el agente.

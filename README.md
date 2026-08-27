@@ -3,9 +3,18 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Servidor MCP de solo lectura que expone herramientas para consultar
-**Datadog** (monitores y logs), **AWS CloudWatch Logs** y, opcionalmente,
-leer código fuente de **Azure Repos** (Azure DevOps) — y para agrupar
+**Datadog** (monitores y logs), **AWS CloudWatch Logs**, y leer código
+fuente de **Azure Repos** (Azure DevOps) o **GitHub** — y para agrupar
 errores recurrentes por "fingerprint" (huella del mensaje de error).
+
+**Las 4 fuentes son independientes y 100% opcionales.** No necesitas
+configurarlas todas: activa solo las que uses, en cualquier combinación
+— solo AWS, solo Datadog, solo Git (Azure Repos y/o GitHub), AWS+GitHub,
+AWS+Datadog, las 4 juntas, etc. Cada herramienta que dependa de una
+fuente no configurada devuelve un error claro explicando qué falta, en
+vez de fallar de forma confusa; y `find_recurring_errors` simplemente
+omite las fuentes no configuradas (lo reporta en su respuesta) en vez de
+fallar por completo.
 
 Está pensado para usarse junto con **Claude Code**: Claude consulta estas
 herramientas para diagnosticar qué está fallando, y luego usa sus
@@ -31,9 +40,9 @@ cp .env.example .env
 Copy-Item .env.example .env
 ```
 
-Edita `.env` con tus API keys de Datadog (obligatorio), y configura
-credenciales de AWS con `aws configure` o variables de entorno
-(obligatorio). Azure Repos es opcional — ver su propia sección más abajo.
+Edita `.env` y activa **solo las fuentes que vayas a usar** (ver tabla
+abajo) — ninguna es obligatoria por sí sola, pero necesitas al menos una
+para que el servidor tenga algo que consultar.
 
 > **Nota:** si clonas el repo estando ya dentro de la carpeta destino
 > (ej. `cd C:\Proyectos\mi-repo` y luego `git clone ...` ahí mismo), Git
@@ -41,27 +50,44 @@ credenciales de AWS con `aws configure` o variables de entorno
 > `ls` que `server.py` y `requirements.txt` estén en tu carpeta actual
 > antes de instalar — si no, entra un nivel más con `cd datadog-aws-mcp`.
 
+## Fuentes: todas opcionales, cualquier combinación
+
+| Fuente | Variables en `.env` | Qué necesitas |
+|---|---|---|
+| Datadog | `DD_API_KEY`, `DD_APP_KEY`, `DD_SITE` | API Key + Application Key de Datadog |
+| AWS CloudWatch | `AWS_REGION` | Credenciales AWS estándar (`aws configure`, env vars, o rol) |
+| Azure Repos | `AZURE_DEVOPS_ORG`, `AZURE_DEVOPS_PAT` | PAT de Azure DevOps, scope "Code (Read)" |
+| GitHub | `GITHUB_TOKEN` (opcional), `GITHUB_API_URL` | Nada para repos públicos; PAT fine-grained "Contents: Read-only" para privados |
+
+Deja vacías las variables de la fuente que no uses — el resto del
+servidor sigue funcionando igual. Combina las que quieras: por ejemplo
+solo AWS + GitHub (sin Datadog ni Azure), o solo Datadog, o las 4.
+
 ## Herramientas expuestas
 
-| Herramienta | Qué hace |
-|---|---|
-| `datadog_triggered_monitors` | Monitores de Datadog actualmente en Alert/Warn |
-| `datadog_recent_errors` | Logs de error recientes en Datadog (por query) |
-| `cloudwatch_list_log_groups` | Lista log groups de CloudWatch disponibles |
-| `cloudwatch_recent_errors` | Logs de error recientes en un log group |
-| `find_recurring_errors` | Combina Datadog + CloudWatch y agrupa errores repetidos |
-| `check_known_incident` | Consulta si un error (por fingerprint) ya fue diagnosticado antes |
-| `record_incident_resolution` | Registra diagnóstico + fix + resultado en el historial |
-| `list_incident_history` | Lista el historial de incidentes registrados |
-| `azure_devops_list_projects` | *(opcional)* Lista proyectos de tu organización de Azure DevOps |
-| `azure_repos_list_repos` | *(opcional)* Lista repos Git dentro de un proyecto de Azure DevOps |
-| `azure_repos_get_file` | *(opcional)* Lee el contenido de un archivo en un repo de Azure Repos |
-| `azure_repos_search_code` | *(opcional)* Busca texto/código en los repos de Azure Repos |
+| Herramienta | Fuente | Qué hace |
+|---|---|---|
+| `datadog_triggered_monitors` | Datadog | Monitores actualmente en Alert/Warn |
+| `datadog_recent_errors` | Datadog | Logs de error recientes (por query) |
+| `cloudwatch_list_log_groups` | AWS | Lista log groups de CloudWatch disponibles |
+| `cloudwatch_recent_errors` | AWS | Logs de error recientes en un log group |
+| `find_recurring_errors` | Datadog + AWS | Combina las fuentes configuradas y agrupa errores repetidos |
+| `check_known_incident` | — (local) | Consulta si un error (por fingerprint) ya fue diagnosticado antes |
+| `record_incident_resolution` | — (local) | Registra diagnóstico + fix + resultado en el historial |
+| `list_incident_history` | — (local) | Lista el historial de incidentes registrados |
+| `azure_devops_list_projects` | Azure Repos | Lista proyectos de tu organización de Azure DevOps |
+| `azure_repos_list_repos` | Azure Repos | Lista repos Git dentro de un proyecto |
+| `azure_repos_get_file` | Azure Repos | Lee el contenido de un archivo |
+| `azure_repos_search_code` | Azure Repos | Busca texto/código (requiere extensión "Azure DevOps Search") |
+| `github_list_repos` | GitHub | Lista repos de un usuario/organización |
+| `github_get_file` | GitHub | Lee el contenido de un archivo |
+| `github_search_code` | GitHub | Busca texto/código (requiere `GITHUB_TOKEN`) |
 
-Ninguna herramienta escribe, borra ni modifica nada en Datadog, AWS ni
-Azure Repos — son de solo lectura a propósito. Las 3 herramientas de
-historial de incidentes sí escriben, pero solo en un archivo local del
-propio MCP (`incident_history.json`), nunca en Datadog/AWS/Azure/tu repo.
+Ninguna herramienta escribe, borra ni modifica nada en Datadog, AWS,
+Azure Repos ni GitHub — son de solo lectura a propósito. Las 3
+herramientas de historial de incidentes sí escriben, pero solo en un
+archivo local del propio MCP (`incident_history.json`), nunca en
+Datadog/AWS/Azure/GitHub/tu repo.
 
 ## Azure Repos (opcional)
 
@@ -92,6 +118,28 @@ repo está en Azure DevOps, `azure_devops_list_projects` y
 `azure_repos_get_file` (o `azure_repos_search_code`, si tu organización
 tiene habilitada la extensión "Azure DevOps Search") para leer el
 archivo relevante antes de proponer el fix.
+
+## GitHub (opcional)
+
+Si el código fuente vive en **GitHub** en vez de (o además de) Azure
+Repos, agrega a tu `.env`:
+
+```bash
+GITHUB_TOKEN=tu_personal_access_token   # opcional para repos públicos
+# GITHUB_API_URL=https://api.github.com  # cambia solo si usas GitHub Enterprise Server
+```
+
+Sin `GITHUB_TOKEN`, `github_list_repos` y `github_get_file` funcionan
+igual pero limitados a repos **públicos** y con límites de rate más
+bajos (la API de GitHub lo permite así). `github_search_code` sí exige
+un token siempre — la Search API de GitHub no acepta búsquedas sin
+autenticación, ni en repos públicos.
+
+Para repos privados, crea un token fine-grained en
+`https://github.com/settings/tokens?type=beta` con el scope de solo
+lectura **"Contents: Read-only"** sobre los repos que necesites — nada
+más. Igual que las demás fuentes, es completamente opcional y genérico:
+no está atado a ningún usuario/organización en particular.
 
 ## Modo experto: el archivo PLAYBOOK.md
 
@@ -163,8 +211,10 @@ Claude Code (o Claude Desktop) podrías pedir algo como:
 
 ## Seguridad
 
-- Usa credenciales de **solo lectura** para Datadog, AWS y Azure DevOps
-  (PAT con scope "Code (Read)" únicamente) en este servidor.
+- Usa credenciales de **solo lectura** en cada fuente que actives: AWS
+  (rol/política read-only), Datadog (API/App key read-only), Azure
+  DevOps (PAT scope "Code (Read)") y GitHub (token fine-grained
+  "Contents: Read-only").
 - Nunca subas tu archivo `.env` real a git (ya debería estar en
   `.gitignore` de tu proyecto).
 - El paso de despliegue automático queda deliberadamente fuera de este

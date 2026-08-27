@@ -1,17 +1,19 @@
 {
-  "_comentario": "Ejemplo de cómo registrar este servidor MCP local en Claude Code o Claude Desktop. Ajusta las rutas y variables según tu entorno. Verifica el formato exacto vigente en la documentación oficial (docs.claude.com), ya que puede cambiar. Las 3 claves AZURE_DEVOPS_* son opcionales: bórralas si no vas a usar las herramientas de Azure Repos. IMPORTANTE: en Claude Desktop instalado como app empaquetada de Windows (Microsoft Store / MSIX), este bloque 'mcpServers' NO va en un archivo nuevo en %APPDATA%\\Claude — hay que fusionarlo dentro del archivo real de config de la app, que suele estar en %LOCALAPPDATA%\\Packages\\<Claude...>\\LocalCache\\Roaming\\Claude\\claude_desktop_config.json (usa el botón 'Editar configuración' dentro de la app, en Desarrollador → Servidores MCP locales, para abrir el archivo correcto y ver su ruta real).",
+  "_comentario": "Ejemplo de cómo registrar este servidor MCP local en Claude Code o Claude Desktop. Ajusta las rutas y variables según tu entorno. Verifica el formato exacto vigente en la documentación oficial (docs.claude.com), ya que puede cambiar. TODAS las variables salvo AWS_REGION/DD_SITE son opcionales de forma independiente — borra las de las fuentes que no vayas a usar (ej. si no usas Azure Repos, borra las 3 AZURE_DEVOPS_*; si no usas Datadog, borra DD_API_KEY/DD_APP_KEY/DD_SITE; etc.) y deja solo las que necesites, en la combinación que quieras. IMPORTANTE: en Claude Desktop instalado como app empaquetada de Windows (Microsoft Store / MSIX), este bloque 'mcpServers' NO va en un archivo nuevo en %APPDATA%\\Claude — hay que fusionarlo dentro del archivo real de config de la app, que suele estar en %LOCALAPPDATA%\\Packages\\<Claude...>\\LocalCache\\Roaming\\Claude\\claude_desktop_config.json (usa el botón 'Editar configuración' dentro de la app, en Desarrollador → Servidores MCP locales, para abrir el archivo correcto y ver su ruta real). Si esa app no ve tu ~/.aws/credentials (mismo problema de sandboxing), agrega también AWS_ACCESS_KEY_ID y AWS_SECRET_ACCESS_KEY aquí mismo en vez de depender de `aws configure`.",
   "mcpServers": {
     "datadog-aws-integration": {
       "command": "python",
       "args": ["/ruta/absoluta/a/datadog-aws-mcp/server.py"],
       "env": {
-        "DD_API_KEY": "tu_api_key",
-        "DD_APP_KEY": "tu_app_key",
+        "DD_API_KEY": "tu_api_key (opcional)",
+        "DD_APP_KEY": "tu_app_key (opcional)",
         "DD_SITE": "datadoghq.com",
         "AWS_REGION": "us-east-1",
         "AZURE_DEVOPS_ORG": "tu_organizacion (opcional)",
         "AZURE_DEVOPS_PAT": "tu_personal_access_token (opcional)",
-        "AZURE_DEVOPS_API_VERSION": "7.1"
+        "AZURE_DEVOPS_API_VERSION": "7.1",
+        "GITHUB_TOKEN": "tu_personal_access_token (opcional)",
+        "GITHUB_API_URL": "https://api.github.com"
       }
     }
   }
