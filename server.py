@@ -159,6 +159,57 @@ def _cloudwatch_client():
         ) from e
 
 
+def _ec2_client():
+    """Crea el cliente de boto3 para EC2 (NAT Gateways / Elastic IPs / VPCs).
+
+    Requiere, además de las credenciales de AWS ya usadas por
+    _cloudwatch_client, permisos de solo lectura de red que el usuario/rol
+    de AWS puede no tener todavía: 'ec2:DescribeNatGateways',
+    'ec2:DescribeAddresses' y 'ec2:DescribeVpcs' (por ejemplo, la política
+    administrada AmazonEC2ReadOnlyAccess, o una política mínima con solo
+    esas tres acciones). Sin ellos, AWS devuelve AccessDenied/
+    UnauthorizedOperation — lo traducimos aquí a un mensaje claro.
+    """
+    try:
+        client = boto3.client("ec2", region_name=AWS_REGION)
+        client.describe_nat_gateways(MaxResults=5)
+        return client
+    except (BotoCoreError, ClientError) as e:
+        raise RuntimeError(
+            "No se pudo consultar EC2 (NAT Gateways / IPs de red): "
+            f"{e}. Si el error es de permisos (AccessDenied / "
+            "UnauthorizedOperation), el usuario de AWS en tu .env necesita "
+            "además de CloudWatchLogsReadOnlyAccess los permisos de solo "
+            "lectura 'ec2:DescribeNatGateways', 'ec2:DescribeAddresses' y "
+            "'ec2:DescribeVpcs' (ej. la política administrada "
+            "AmazonEC2ReadOnlyAccess). Esta fuente es opcional — si no la "
+            "necesitas, usa Datadog/Azure Repos/GitHub."
+        ) from e
+
+
+def _elbv2_client():
+    """Crea el cliente de boto3 para Elastic Load Balancing v2 (ALB/NLB).
+
+    Requiere el permiso de solo lectura
+    'elasticloadbalancing:DescribeLoadBalancers' (ej. la política
+    administrada ElasticLoadBalancingReadOnly), que el usuario/rol de AWS
+    puede no tener todavía.
+    """
+    try:
+        client = boto3.client("elbv2", region_name=AWS_REGION)
+        client.describe_load_balancers(PageSize=5)
+        return client
+    except (BotoCoreError, ClientError) as e:
+        raise RuntimeError(
+            "No se pudo consultar Elastic Load Balancing: "
+            f"{e}. El usuario de AWS en tu .env necesita el permiso de "
+            "solo lectura 'elasticloadbalancing:DescribeLoadBalancers' "
+            "(ej. la política administrada ElasticLoadBalancingReadOnly). "
+            "Esta fuente es opcional — si no la necesitas, usa Datadog/"
+            "Azure Repos/GitHub."
+        ) from e
+
+
 def _require_datadog_config() -> None:
     if not DD_API_KEY or not DD_APP_KEY:
         raise RuntimeError(
@@ -344,6 +395,102 @@ def cloudwatch_list_log_groups(prefix: Optional[str] = None) -> str:
     return json.dumps(groups, indent=2, ensure_ascii=False)
 
 
+@mcp.tool()
+def aws_network_egress_ips(name_filter: Optional[str] = None) -> str:
+    """Lista las IPs públicas de salida (Elastic IPs de los NAT Gateways)
+    de la cuenta de AWS, agrupadas por VPC.
+
+    Útil para responder "¿qué IP ve un tercero (ej. un partner que hace
+    whitelist) cuando el tráfico sale desde tal ambiente/VPC?" sin tener
+    que esperar a que esa IP aparezca de rebote en un log de error.
+
+    Args:
+        name_filter: si se indica, filtra por el tag "Name" del NAT
+            Gateway o de su VPC (búsqueda parcial, sin distinguir
+            mayúsculas — ej. "prod", "dev", "neat").
+
+    Requiere permisos de solo lectura de EC2 — ver el docstring de
+    _ec2_client para el detalle exacto. Fuente opcional.
+    """
+    client = _ec2_client()
+    nats = client.describe_nat_gateways().get("NatGateways", [])
+
+    vpc_ids = sorted({n.get("VpcId") for n in nats if n.get("VpcId")})
+    vpc_names = {}
+    if vpc_ids:
+        vpcs = client.describe_vpcs(VpcIds=vpc_ids).get("Vpcs", [])
+        for v in vpcs:
+            tags = {t["Key"]: t["Value"] for t in v.get("Tags", [])}
+            vpc_names[v["VpcId"]] = tags.get("Name", v["VpcId"])
+
+    results = []
+    for n in nats:
+        if n.get("State") != "available":
+            continue
+        nat_tags = {t["Key"]: t["Value"] for t in n.get("Tags", [])}
+        nat_name = nat_tags.get("Name", n.get("NatGatewayId"))
+        vpc_id = n.get("VpcId")
+        vpc_name = vpc_names.get(vpc_id, vpc_id)
+
+        if name_filter:
+            haystack = f"{nat_name} {vpc_name}".lower()
+            if name_filter.lower() not in haystack:
+                continue
+
+        public_ips = [
+            addr.get("PublicIp")
+            for addr in n.get("NatGatewayAddresses", [])
+            if addr.get("PublicIp")
+        ]
+        results.append({
+            "nat_gateway_id": n.get("NatGatewayId"),
+            "name": nat_name,
+            "vpc_id": vpc_id,
+            "vpc_name": vpc_name,
+            "public_ips": public_ips,
+        })
+
+    return json.dumps(results, indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+def aws_list_load_balancers(name_filter: Optional[str] = None) -> str:
+    """Lista los Load Balancers (ALB/NLB) de la cuenta de AWS: nombre,
+    tipo, si son públicos o internos, DNS name y VPC.
+
+    Útil para ubicar el front de un operador. OJO: un ALB normal NO tiene
+    IP pública fija — su DNS name puede resolver a varias IPs que AWS
+    rota sin aviso. Solo un NLB con Elastic IP asignada tiene IP fija.
+    Para una IP estable, usa aws_network_egress_ips (tráfico saliente) o
+    resuelve este DNS name en el momento que lo necesites.
+
+    Args:
+        name_filter: si se indica, filtra por nombre del load balancer
+            (búsqueda parcial, sin distinguir mayúsculas).
+
+    Requiere el permiso de solo lectura
+    'elasticloadbalancing:DescribeLoadBalancers'. Fuente opcional.
+    """
+    client = _elbv2_client()
+    lbs = client.describe_load_balancers().get("LoadBalancers", [])
+
+    results = []
+    for lb in lbs:
+        name = lb.get("LoadBalancerName", "")
+        if name_filter and name_filter.lower() not in name.lower():
+            continue
+        results.append({
+            "name": name,
+            "type": lb.get("Type"),
+            "scheme": lb.get("Scheme"),
+            "dns_name": lb.get("DNSName"),
+            "vpc_id": lb.get("VpcId"),
+            "state": lb.get("State", {}).get("Code"),
+        })
+
+    return json.dumps(results, indent=2, ensure_ascii=False)
+
+
 # ---------------------------------------------------------------------------
 # Herramientas: Azure Repos (Azure DevOps) — opcional
 # ---------------------------------------------------------------------------
@@ -440,10 +587,20 @@ async def azure_repos_get_file(
     async with httpx.AsyncClient() as client:
         resp = await client.get(url, headers=_azure_headers(), params=params)
         resp.raise_for_status()
-        data = resp.json()
+        # La API de Items de Azure Repos devuelve el contenido crudo del
+        # archivo en el body (no un JSON con un campo "content") cuando se
+        # pide sin "$format=json". Antes este código hacía resp.json() y
+        # buscaba data["content"], que nunca existe: si el archivo es JSON
+        # válido (ej. package.json) el archivo entero se parseaba como el
+        # "sobre" y content quedaba en "" por defecto; si no es JSON (ej.
+        # README.md) resp.json() lanzaba "Expecting value: line 1 column 1".
+        try:
+            content = resp.text
+        except UnicodeDecodeError:
+            content = "<archivo binario, no se puede mostrar como texto>"
 
     return json.dumps(
-        {"path": data.get("path", path), "content": data.get("content", "")},
+        {"path": path, "content": content},
         indent=2,
         ensure_ascii=False,
     )

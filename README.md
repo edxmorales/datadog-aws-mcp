@@ -71,6 +71,8 @@ solo AWS + GitHub (sin Datadog ni Azure), o solo Datadog, o las 4.
 | `datadog_recent_errors` | Datadog | Logs de error recientes (por query) |
 | `cloudwatch_list_log_groups` | AWS | Lista log groups de CloudWatch disponibles |
 | `cloudwatch_recent_errors` | AWS | Logs de error recientes en un log group |
+| `aws_network_egress_ips` | AWS | IPs públicas de salida (Elastic IP de los NAT Gateway) por VPC — requiere permisos extra de EC2, ver abajo |
+| `aws_list_load_balancers` | AWS | Lista ALB/NLB: nombre, tipo, DNS name, VPC — requiere permiso extra de ELB, ver abajo |
 | `find_recurring_errors` | Datadog + AWS | Combina las fuentes configuradas y agrupa errores repetidos |
 | `check_known_incident` | — (local) | Consulta si un error (por fingerprint) ya fue diagnosticado antes |
 | `record_incident_resolution` | — (local) | Registra diagnóstico + fix + resultado en el historial |
@@ -88,6 +90,16 @@ Azure Repos ni GitHub — son de solo lectura a propósito. Las 3
 herramientas de historial de incidentes sí escriben, pero solo en un
 archivo local del propio MCP (`incident_history.json`), nunca en
 Datadog/AWS/Azure/GitHub/tu repo.
+
+**Permisos extra para `aws_network_egress_ips` / `aws_list_load_balancers`:**
+el usuario/rol de AWS de tu `.env` solo trae `CloudWatchLogsReadOnlyAccess`
+por defecto, y con eso AWS niega el acceso a estas dos herramientas
+(EC2/ELB son servicios distintos). Para habilitarlas, agrégale además,
+de solo lectura: `ec2:DescribeNatGateways`, `ec2:DescribeAddresses`,
+`ec2:DescribeVpcs` y `elasticloadbalancing:DescribeLoadBalancers` — o,
+más simple, las políticas administradas `AmazonEC2ReadOnlyAccess` y
+`ElasticLoadBalancingReadOnly`. Sin esto, ambas herramientas devuelven
+un error explicando exactamente qué falta.
 
 ## Azure Repos (opcional)
 
