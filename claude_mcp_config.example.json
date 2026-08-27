@@ -1,5 +1,5 @@
 {
-  "_comentario": "Ejemplo de cómo registrar este servidor MCP local en Claude Code o Claude Desktop. Ajusta las rutas y variables según tu entorno. Verifica el formato exacto vigente en la documentación oficial (docs.claude.com), ya que puede cambiar.",
+  "_comentario": "Ejemplo de cómo registrar este servidor MCP local en Claude Code o Claude Desktop. Ajusta las rutas y variables según tu entorno. Verifica el formato exacto vigente en la documentación oficial (docs.claude.com), ya que puede cambiar. Las 3 claves AZURE_DEVOPS_* son opcionales: bórralas si no vas a usar las herramientas de Azure Repos. IMPORTANTE: en Claude Desktop instalado como app empaquetada de Windows (Microsoft Store / MSIX), este bloque 'mcpServers' NO va en un archivo nuevo en %APPDATA%\\Claude — hay que fusionarlo dentro del archivo real de config de la app, que suele estar en %LOCALAPPDATA%\\Packages\\<Claude...>\\LocalCache\\Roaming\\Claude\\claude_desktop_config.json (usa el botón 'Editar configuración' dentro de la app, en Desarrollador → Servidores MCP locales, para abrir el archivo correcto y ver su ruta real).",
   "mcpServers": {
     "datadog-aws-integration": {
       "command": "python",
@@ -8,7 +8,10 @@
         "DD_API_KEY": "tu_api_key",
         "DD_APP_KEY": "tu_app_key",
         "DD_SITE": "datadoghq.com",
-        "AWS_REGION": "us-east-1"
+        "AWS_REGION": "us-east-1",
+        "AZURE_DEVOPS_ORG": "tu_organizacion (opcional)",
+        "AZURE_DEVOPS_PAT": "tu_personal_access_token (opcional)",
+        "AZURE_DEVOPS_API_VERSION": "7.1"
       }
     }
   }

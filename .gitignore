@@ -1,0 +1,20 @@
+# Credenciales locales — nunca subir
+.env
+claude_mcp_config.json
+
+# Historial de incidentes local (datos del propio uso del MCP, no del repo)
+incident_history.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Editores / SO
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,17 +1,21 @@
 """
-Servidor MCP: integración con Datadog y AWS CloudWatch/Logs.
+Servidor MCP: integración con Datadog, AWS CloudWatch/Logs y (opcional)
+Azure Repos.
 
 Expone herramientas que Claude (vía Claude Code, la API con mcp_servers,
 o Claude Desktop) puede usar para:
   - Consultar errores/monitores disparados en Datadog.
   - Consultar logs de error en CloudWatch.
   - Agrupar/detectar errores recurrentes (misma huella / fingerprint).
+  - Leer código fuente de repos alojados en Azure Repos (Azure DevOps),
+    para diagnosticar errores cuyo código vive ahí en vez de GitHub.
 
 IMPORTANTE (seguridad):
   - Las credenciales se leen de variables de entorno, nunca hardcodeadas.
-  - El rol IAM y las API keys usadas aquí deben tener SOLO permisos de
-    lectura (CloudWatch Logs read-only, Datadog read-only). Este servidor
-    NO expone herramientas de escritura/despliegue a propósito: esa parte
+  - El rol IAM, las API keys de Datadog y el PAT de Azure DevOps usados
+    aquí deben tener SOLO permisos de lectura (CloudWatch Logs read-only,
+    Datadog read-only, Azure DevOps "Code (Read)"). Este servidor NO
+    expone herramientas de escritura/despliegue a propósito: esa parte
     (crear rama, hacer commit, abrir PR, deploy) se recomienda dejarla en
     manos de Claude Code usando git/gh directamente, con revisión humana
     antes de mergear o desplegar.
@@ -22,8 +26,12 @@ Requisitos:
 Variables de entorno esperadas (ver .env.example):
     DD_API_KEY, DD_APP_KEY, DD_SITE (por defecto datadoghq.com)
     AWS_REGION (usa las credenciales estándar de AWS: perfil, rol, etc.)
+    AZURE_DEVOPS_ORG, AZURE_DEVOPS_PAT (opcionales — solo si tu código
+        fuente vive en Azure Repos; si no se configuran, las herramientas
+        de Azure simplemente devuelven un error explicando qué falta)
 """
 
+import base64
 import os
 import time
 import json
@@ -44,6 +52,14 @@ DD_API_KEY = os.environ.get("DD_API_KEY", "")
 DD_APP_KEY = os.environ.get("DD_APP_KEY", "")
 DD_SITE = os.environ.get("DD_SITE", "datadoghq.com")
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
+
+# Azure Repos (Azure DevOps) es opcional: solo hace falta si el código
+# fuente que quieres que Claude lea vive ahí. Genérico a propósito — no
+# asume una organización/proyecto/repo fijo, para que cualquiera pueda
+# apuntarlo a su propia cuenta de Azure DevOps vía .env.
+AZURE_DEVOPS_ORG = os.environ.get("AZURE_DEVOPS_ORG", "")
+AZURE_DEVOPS_PAT = os.environ.get("AZURE_DEVOPS_PAT", "")
+AZURE_DEVOPS_API_VERSION = os.environ.get("AZURE_DEVOPS_API_VERSION", "7.1")
 
 # Archivo local donde se guarda el historial de incidentes ya diagnosticados
 # y resueltos. Esto es lo que le da al agente "memoria" de casos pasados,
@@ -91,6 +107,30 @@ def _dd_headers() -> dict:
         "DD-APPLICATION-KEY": DD_APP_KEY,
         "Content-Type": "application/json",
     }
+
+
+def _require_azure_config() -> None:
+    if not AZURE_DEVOPS_ORG or not AZURE_DEVOPS_PAT:
+        raise RuntimeError(
+            "Azure DevOps no está configurado en este servidor MCP: define "
+            "AZURE_DEVOPS_ORG y AZURE_DEVOPS_PAT en tu .env (PAT con scope "
+            "de solo lectura 'Code (Read)') para usar las herramientas de "
+            "Azure Repos. Ver README.md, sección 'Azure Repos (opcional)'."
+        )
+
+
+def _azure_headers() -> dict:
+    token = base64.b64encode(f":{AZURE_DEVOPS_PAT}".encode()).decode()
+    return {
+        "Authorization": f"Basic {token}",
+        "Content-Type": "application/json",
+    }
+
+
+def _azure_base_url(project: Optional[str] = None) -> str:
+    if project:
+        return f"https://dev.azure.com/{AZURE_DEVOPS_ORG}/{project}/_apis"
+    return f"https://dev.azure.com/{AZURE_DEVOPS_ORG}/_apis"
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +259,156 @@ def cloudwatch_list_log_groups(prefix: Optional[str] = None) -> str:
     resp = client.describe_log_groups(**kwargs)
     groups = [g["logGroupName"] for g in resp.get("logGroups", [])]
     return json.dumps(groups, indent=2, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# Herramientas: Azure Repos (Azure DevOps) — opcional
+# ---------------------------------------------------------------------------
+#
+# Genéricas a propósito: no asumen una organización, proyecto o repo fijo.
+# Cualquiera que instale este MCP las activa apuntándolas a su propia
+# cuenta de Azure DevOps vía AZURE_DEVOPS_ORG / AZURE_DEVOPS_PAT en el
+# .env. Si no se configuran, cada herramienta devuelve un error claro en
+# vez de fallar de forma confusa.
+#
+# Útiles cuando el código fuente del servicio que está fallando (visto en
+# find_recurring_errors) vive en Azure Repos en vez de GitHub: primero
+# ubica el proyecto/repo, y luego lee el archivo relevante para diagnosticar
+# antes de proponer un fix.
+
+@mcp.tool()
+async def azure_devops_list_projects() -> str:
+    """Lista los proyectos disponibles en tu organización de Azure DevOps.
+
+    Úsala primero para saber qué nombre exacto de 'project' pasarle a
+    azure_repos_list_repos / azure_repos_get_file / azure_repos_search_code.
+
+    Requiere AZURE_DEVOPS_ORG y AZURE_DEVOPS_PAT configurados en el .env
+    (ver README.md, sección 'Azure Repos (opcional)').
+    """
+    _require_azure_config()
+    url = f"{_azure_base_url()}/projects"
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            url, headers=_azure_headers(), params={"api-version": AZURE_DEVOPS_API_VERSION}
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    projects = [{"id": p["id"], "name": p["name"]} for p in data.get("value", [])]
+    return json.dumps(projects, indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+async def azure_repos_list_repos(project: str) -> str:
+    """Lista los repositorios Git dentro de un proyecto de Azure DevOps.
+
+    Args:
+        project: nombre o ID del proyecto (ver azure_devops_list_projects).
+    """
+    _require_azure_config()
+    url = f"{_azure_base_url(project)}/git/repositories"
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            url, headers=_azure_headers(), params={"api-version": AZURE_DEVOPS_API_VERSION}
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    repos = [
+        {
+            "id": r["id"],
+            "name": r["name"],
+            "default_branch": r.get("defaultBranch"),
+            "web_url": r.get("webUrl"),
+        }
+        for r in data.get("value", [])
+    ]
+    return json.dumps(repos, indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+async def azure_repos_get_file(
+    project: str, repository: str, path: str, branch: Optional[str] = None
+) -> str:
+    """Obtiene el contenido de un archivo de un repo de Azure Repos.
+
+    Útil para leer el código fuente real al diagnosticar un error (ej.
+    después de find_recurring_errors) cuando el repo vive en Azure DevOps
+    en vez de GitHub.
+
+    Args:
+        project: nombre o ID del proyecto.
+        repository: nombre o ID del repositorio (ver azure_repos_list_repos).
+        path: ruta del archivo dentro del repo (ej. "/src/checkout/handler.py").
+        branch: rama a consultar (por defecto, la rama por defecto del repo).
+    """
+    _require_azure_config()
+    url = f"{_azure_base_url(project)}/git/repositories/{repository}/items"
+    params = {
+        "path": path,
+        "api-version": AZURE_DEVOPS_API_VERSION,
+        "includeContent": "true",
+    }
+    if branch:
+        params["versionDescriptor.version"] = branch
+        params["versionDescriptor.versionType"] = "branch"
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, headers=_azure_headers(), params=params)
+        resp.raise_for_status()
+        data = resp.json()
+
+    return json.dumps(
+        {"path": data.get("path", path), "content": data.get("content", "")},
+        indent=2,
+        ensure_ascii=False,
+    )
+
+
+@mcp.tool()
+async def azure_repos_search_code(
+    project: str, search_text: str, repository: Optional[str] = None, top: int = 20
+) -> str:
+    """Busca texto/código dentro de los repos de Azure Repos.
+
+    Requiere que la extensión gratuita "Azure DevOps Search" esté
+    habilitada en tu organización (si no lo está, la API devuelve error;
+    en ese caso usa azure_repos_get_file con la ruta exacta en su lugar).
+
+    Útil para ubicar en qué archivo vive el código relacionado con un
+    mensaje de error antes de proponer un fix.
+
+    Args:
+        project: nombre o ID del proyecto donde buscar.
+        search_text: texto o snippet de código a buscar.
+        repository: si se indica, limita la búsqueda a ese repo.
+        top: máximo de resultados a devolver.
+    """
+    _require_azure_config()
+    url = f"https://almsearch.dev.azure.com/{AZURE_DEVOPS_ORG}/{project}/_apis/search/codesearchresults"
+    body = {"searchText": search_text, "$top": top}
+    if repository:
+        body["filters"] = {"Repository": [repository]}
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            url,
+            headers=_azure_headers(),
+            params={"api-version": AZURE_DEVOPS_API_VERSION},
+            json=body,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    results = [
+        {
+            "file": r.get("path"),
+            "repository": r.get("repository", {}).get("name"),
+        }
+        for r in data.get("results", [])
+    ]
+    return json.dumps(results, indent=2, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------

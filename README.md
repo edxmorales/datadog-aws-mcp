@@ -3,7 +3,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Servidor MCP de solo lectura que expone herramientas para consultar
-**Datadog** (monitores y logs) y **AWS CloudWatch Logs**, y para agrupar
+**Datadog** (monitores y logs), **AWS CloudWatch Logs** y, opcionalmente,
+leer código fuente de **Azure Repos** (Azure DevOps) — y para agrupar
 errores recurrentes por "fingerprint" (huella del mensaje de error).
 
 Está pensado para usarse junto con **Claude Code**: Claude consulta estas
@@ -15,12 +16,30 @@ o desplegar.
 ## Instalación
 
 ```bash
+git clone https://github.com/edxmorales/datadog-aws-mcp.git
 cd datadog-aws-mcp
 pip install -r requirements.txt --break-system-packages
-cp .env.example .env
-# edita .env con tus API keys de Datadog
-# configura credenciales de AWS con `aws configure` o variables de entorno
 ```
+
+Crea tu archivo de variables de entorno a partir del ejemplo:
+
+```bash
+# macOS/Linux
+cp .env.example .env
+
+# Windows (PowerShell) — `cp` como en bash no siempre existe; usa:
+Copy-Item .env.example .env
+```
+
+Edita `.env` con tus API keys de Datadog (obligatorio), y configura
+credenciales de AWS con `aws configure` o variables de entorno
+(obligatorio). Azure Repos es opcional — ver su propia sección más abajo.
+
+> **Nota:** si clonas el repo estando ya dentro de la carpeta destino
+> (ej. `cd C:\Proyectos\mi-repo` y luego `git clone ...` ahí mismo), Git
+> crea una subcarpeta anidada con el mismo nombre. Verifica con `dir` /
+> `ls` que `server.py` y `requirements.txt` estén en tu carpeta actual
+> antes de instalar — si no, entra un nivel más con `cd datadog-aws-mcp`.
 
 ## Herramientas expuestas
 
@@ -34,11 +53,45 @@ cp .env.example .env
 | `check_known_incident` | Consulta si un error (por fingerprint) ya fue diagnosticado antes |
 | `record_incident_resolution` | Registra diagnóstico + fix + resultado en el historial |
 | `list_incident_history` | Lista el historial de incidentes registrados |
+| `azure_devops_list_projects` | *(opcional)* Lista proyectos de tu organización de Azure DevOps |
+| `azure_repos_list_repos` | *(opcional)* Lista repos Git dentro de un proyecto de Azure DevOps |
+| `azure_repos_get_file` | *(opcional)* Lee el contenido de un archivo en un repo de Azure Repos |
+| `azure_repos_search_code` | *(opcional)* Busca texto/código en los repos de Azure Repos |
 
-Ninguna herramienta escribe, borra ni modifica nada en Datadog o AWS —
-son de solo lectura a propósito. Las 3 herramientas de historial de
-incidentes sí escriben, pero solo en un archivo local del propio MCP
-(`incident_history.json`), nunca en Datadog/AWS/tu repo.
+Ninguna herramienta escribe, borra ni modifica nada en Datadog, AWS ni
+Azure Repos — son de solo lectura a propósito. Las 3 herramientas de
+historial de incidentes sí escriben, pero solo en un archivo local del
+propio MCP (`incident_history.json`), nunca en Datadog/AWS/Azure/tu repo.
+
+## Azure Repos (opcional)
+
+Si el código fuente que Claude necesita leer para diagnosticar un error
+vive en **Azure Repos** (Azure DevOps) en vez de GitHub, agrega estas dos
+variables a tu `.env`:
+
+```bash
+AZURE_DEVOPS_ORG=tu_organizacion       # el nombre en https://dev.azure.com/<org>
+AZURE_DEVOPS_PAT=tu_personal_access_token
+```
+
+El PAT (Personal Access Token) se crea en
+`https://dev.azure.com/<tu-org>/_usersSettings/tokens` con el scope de
+**solo lectura "Code (Read)"** — nada más. Igual que con Datadog y AWS,
+no le des permisos de escritura a este servidor.
+
+Es completamente opcional y genérico: no está atado a ninguna
+organización/proyecto/repo en particular, así que cualquiera que instale
+este MCP lo apunta a su propia cuenta de Azure DevOps. Si dejas
+`AZURE_DEVOPS_ORG` / `AZURE_DEVOPS_PAT` vacíos, el resto del servidor
+sigue funcionando normal — esas 4 herramientas simplemente devuelven un
+error explicando qué falta si Claude intenta usarlas.
+
+Flujo típico: `find_recurring_errors` para detectar el error → si el
+repo está en Azure DevOps, `azure_devops_list_projects` y
+`azure_repos_list_repos` para ubicar dónde vive el código → 
+`azure_repos_get_file` (o `azure_repos_search_code`, si tu organización
+tiene habilitada la extensión "Azure DevOps Search") para leer el
+archivo relevante antes de proponer el fix.
 
 ## Modo experto: el archivo PLAYBOOK.md
 
@@ -54,12 +107,36 @@ que Claude siga ese flujo por defecto.
 
 ## Registrarlo en Claude Code / Claude Desktop
 
-Copia `claude_mcp_config.example.json` a la ubicación de configuración de
-MCP que use tu instalación de Claude Code/Desktop (revisa la doc oficial
-en docs.claude.com, el nombre y ruta exactos del archivo de config puede
-variar según versión) y ajusta la ruta absoluta a `server.py`.
+Copia el contenido de `claude_mcp_config.example.json` (la clave
+`mcpServers`) al archivo de configuración de MCP que use tu instalación
+de Claude Code/Desktop, y ajusta la ruta absoluta a `server.py`. Si el
+archivo de configuración ya tiene contenido (otros servidores MCP, u
+otras preferencias de la app), **fusiona** tu bloque `mcpServers` dentro
+de lo que ya existe — no reemplaces el archivo completo.
 
-Una vez registrado, en una sesión de Claude Code podrías pedir algo como:
+> **Dónde está ese archivo — ojo con esto en Windows:** el nombre y ruta
+> exactos pueden variar según versión (revisa la doc oficial en
+> docs.claude.com), pero además, si tu Claude Desktop está instalado como
+> **app empaquetada de Windows** (Microsoft Store / MSIX — se ve como
+> `Claude_<id-aleatorio>` en `AppData\Local\Packages`), el archivo **no**
+> está en el `%APPDATA%\Claude\` clásico, sino en una carpeta virtualizada
+> tipo:
+> ```
+> C:\Users\<tu_usuario>\AppData\Local\Packages\Claude_<id>\LocalCache\Roaming\Claude\claude_desktop_config.json
+> ```
+> La forma confiable de encontrarlo sin adivinar: dentro de la app, ve a
+> **Desarrollador → Servidores MCP locales → "Editar configuración"** —
+> ese botón abre el archivo real que la app está leyendo, y ahí puedes
+> confirmar la ruta exacta.
+>
+> Después de guardar el archivo, cierra Claude Desktop **por completo**
+> (verifica que no quede el proceso corriendo en la bandeja del sistema —
+> en PowerShell: `Stop-Process -Name "Claude" -Force`) y vuelve a abrirlo
+> para que cargue el servidor nuevo.
+
+Una vez registrado, en Desarrollador → Servidores MCP locales deberías
+ver `datadog-aws-integration` en estado **running**. En una sesión de
+Claude Code (o Claude Desktop) podrías pedir algo como:
 
 > "Revisa `find_recurring_errors` con datadog_query='service:checkout
 > status:error' y log_group='/aws/lambda/checkout-prod' de las últimas
@@ -86,7 +163,8 @@ Una vez registrado, en una sesión de Claude Code podrías pedir algo como:
 
 ## Seguridad
 
-- Usa credenciales de **solo lectura** para Datadog y AWS en este servidor.
+- Usa credenciales de **solo lectura** para Datadog, AWS y Azure DevOps
+  (PAT con scope "Code (Read)" únicamente) en este servidor.
 - Nunca subas tu archivo `.env` real a git (ya debería estar en
   `.gitignore` de tu proyecto).
 - El paso de despliegue automático queda deliberadamente fuera de este
