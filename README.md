@@ -52,12 +52,12 @@ para que el servidor tenga algo que consultar.
 
 ## Fuentes: todas opcionales, cualquier combinación
 
-| Fuente | Variables en `.env` | Qué necesitas |
-|---|---|---|
-| Datadog | `DD_API_KEY`, `DD_APP_KEY`, `DD_SITE` | API Key + Application Key de Datadog |
-| AWS CloudWatch | `AWS_REGION` | Credenciales AWS estándar (`aws configure`, env vars, o rol) |
-| Azure Repos | `AZURE_DEVOPS_ORG`, `AZURE_DEVOPS_PAT` | PAT de Azure DevOps, scope "Code (Read)" |
-| GitHub | `GITHUB_TOKEN` (opcional), `GITHUB_API_URL` | Nada para repos públicos; PAT fine-grained "Contents: Read-only" para privados |
+| Fuente | Variables en `.env` | Qué necesitas | Paso a paso |
+|---|---|---|---|
+| Datadog | `DD_API_KEY`, `DD_APP_KEY`, `DD_SITE` | API Key + Application Key de Datadog | [Ver abajo](#datadog-opcional) |
+| AWS CloudWatch | `AWS_REGION` | Credenciales AWS estándar (`aws configure`, env vars, o rol) | [Ver abajo](#aws-cloudwatch-opcional) |
+| Azure Repos | `AZURE_DEVOPS_ORG`, `AZURE_DEVOPS_PAT` | PAT de Azure DevOps, scope "Code (Read)" | [Ver abajo](#azure-repos-opcional) |
+| GitHub | `GITHUB_TOKEN` (opcional), `GITHUB_API_URL` | Nada para repos públicos; PAT fine-grained "Contents: Read-only" para privados | [Ver abajo](#github-opcional) |
 
 Deja vacías las variables de la fuente que no uses — el resto del
 servidor sigue funcionando igual. Combina las que quieras: por ejemplo
@@ -100,6 +100,89 @@ de solo lectura: `ec2:DescribeNatGateways`, `ec2:DescribeAddresses`,
 más simple, las políticas administradas `AmazonEC2ReadOnlyAccess` y
 `ElasticLoadBalancingReadOnly`. Sin esto, ambas herramientas devuelven
 un error explicando exactamente qué falta.
+
+## Datadog (opcional)
+
+Si quieres que Claude consulte monitores y logs de Datadog
+(`datadog_triggered_monitors`, `datadog_recent_errors`), agrega estas
+variables a tu `.env`:
+
+```bash
+DD_API_KEY=tu_api_key
+DD_APP_KEY=tu_application_key
+DD_SITE=datadoghq.com
+```
+
+Cómo conseguir cada una, paso a paso:
+
+1. Entra a tu cuenta de Datadog con el usuario que ya usas normalmente.
+2. **API Key**: menú **Organization Settings → API Keys** (directo:
+   `https://app.datadoghq.com/organization-settings/api-keys`) → botón
+   **New Key** → ponle un nombre (ej. `datadog-aws-mcp`) → copia el
+   valor generado a `DD_API_KEY`.
+3. **Application Key**: menú **Organization Settings → Application
+   Keys** (directo:
+   `https://app.datadoghq.com/organization-settings/application-keys`)
+   → **New Key** → mismo nombre → copia el valor a `DD_APP_KEY`. Una
+   Application Key hereda los permisos del usuario que la crea, así que
+   créala con un usuario que tenga solo permisos de lectura si tu cuenta
+   de Datadog soporta roles granulares.
+4. **`DD_SITE`**: depende del dominio con el que **entras** a Datadog,
+   no de dónde está tu infraestructura:
+
+   | Si entras por... | Usa `DD_SITE=` |
+   |---|---|
+   | `app.datadoghq.com` | `datadoghq.com` (US1 — el más común) |
+   | `app.datadoghq.eu` | `datadoghq.eu` |
+   | `app.us3.datadoghq.com` | `us3.datadoghq.com` |
+   | `app.us5.datadoghq.com` | `us5.datadoghq.com` |
+   | `app.ap1.datadoghq.com` | `ap1.datadoghq.com` |
+   | `app.ddog-gov.com` | `ddog-gov.com` |
+
+Es completamente opcional y genérico — no está atado a ninguna
+organización en particular. Si dejas `DD_API_KEY`/`DD_APP_KEY` vacíos,
+`datadog_triggered_monitors` y `datadog_recent_errors` simplemente
+devuelven un error explicando qué falta, y `find_recurring_errors` omite
+la fuente Datadog en vez de fallar.
+
+## AWS CloudWatch (opcional)
+
+`AWS_REGION` va en tu `.env`, pero las credenciales de AWS **no van
+ahí** — este servidor usa `boto3`, que las toma del entorno estándar de
+AWS (no de este archivo). Paso a paso para crear unas de solo lectura
+desde cero:
+
+1. En la **Consola de AWS → IAM → Users → Create user** (si no tienes
+   permisos de IAM en tu cuenta, pide esto a quien la administre).
+2. Ponle un nombre (ej. `mcp-cloudwatch-readonly`) y en el paso de
+   permisos elige **"Attach policies directly"** → busca y marca la
+   política administrada **`CloudWatchLogsReadOnlyAccess`**. Si además
+   quieres que funcionen `aws_network_egress_ips` y
+   `aws_list_load_balancers`, marca también
+   **`AmazonEC2ReadOnlyAccess`** y **`ElasticLoadBalancingReadOnly`**
+   (ver la nota de permisos extra más abajo).
+3. Crea el usuario → entra a su página de detalle → pestaña **"Security
+   credentials"** → sección **"Access keys"** → **Create access key** →
+   elige el caso de uso **"Application running outside AWS"** → al
+   final copia el **Access key ID** y el **Secret access key** (este
+   último solo se muestra una vez — guárdalo ya).
+4. Configura esas dos credenciales en tu máquina, con **una** de estas
+   opciones:
+   - Corre `aws configure` en tu terminal y pégalas cuando te las pida
+     (junto con la región).
+   - Defínelas como variables de entorno del sistema:
+     `AWS_ACCESS_KEY_ID` y `AWS_SECRET_ACCESS_KEY`.
+   - Si tu Claude Desktop está instalado como **app empaquetada de
+     Windows** (Microsoft Store/MSIX) y por eso no ve tu
+     `~/.aws/credentials`, defínelas directamente como variables
+     adicionales en el `.env` de este proyecto.
+5. En `.env`, deja `AWS_REGION=` apuntando a la región donde están tus
+   log groups (ej. `us-east-1`).
+
+Si dejas esto sin configurar, `cloudwatch_list_log_groups` y
+`cloudwatch_recent_errors` simplemente devuelven un error explicando qué
+falta, y `find_recurring_errors` omite la fuente CloudWatch en vez de
+fallar.
 
 ## Azure Repos (opcional)
 
