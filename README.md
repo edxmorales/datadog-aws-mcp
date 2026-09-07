@@ -58,6 +58,7 @@ para que el servidor tenga algo que consultar.
 | AWS CloudWatch | `AWS_REGION` | Credenciales AWS estándar (`aws configure`, env vars, o rol) | [Ver abajo](#aws-cloudwatch-opcional) |
 | Azure Repos | `AZURE_DEVOPS_ORG`, `AZURE_DEVOPS_PAT` | PAT de Azure DevOps, scope "Code (Read)" | [Ver abajo](#azure-repos-opcional) |
 | GitHub | `GITHUB_TOKEN` (opcional), `GITHUB_API_URL` | Nada para repos públicos; PAT fine-grained "Contents: Read-only" para privados | [Ver abajo](#github-opcional) |
+| DeepSeek | `DEEPSEEK_API_KEY`, `DEEPSEEK_API_URL`, `DEEPSEEK_MODEL` | API key de DeepSeek (nunca obligatoria) | [Ver abajo](#deepseek-opcional) |
 
 Deja vacías las variables de la fuente que no uses — el resto del
 servidor sigue funcionando igual. Combina las que quieras: por ejemplo
@@ -84,6 +85,8 @@ solo AWS + GitHub (sin Datadog ni Azure), o solo Datadog, o las 4.
 | `github_list_repos` | GitHub | Lista repos de un usuario/organización |
 | `github_get_file` | GitHub | Lee el contenido de un archivo |
 | `github_search_code` | GitHub | Busca texto/código (requiere `GITHUB_TOKEN`) |
+| `ask_deepseek` | DeepSeek | Pregunta libre a DeepSeek — fallback si no tienes acceso a Claude |
+| `potenciar_respuesta` | Claude + DeepSeek | Combina un análisis de Claude con una segunda opinión de DeepSeek si está configurado; si no, devuelve el análisis original sin fallar |
 
 Ninguna herramienta escribe, borra ni modifica nada en Datadog, AWS,
 Azure Repos ni GitHub — son de solo lectura a propósito. Las 3
@@ -235,6 +238,42 @@ Para repos privados, crea un token fine-grained en
 lectura **"Contents: Read-only"** sobre los repos que necesites — nada
 más. Igual que las demás fuentes, es completamente opcional y genérico:
 no está atado a ningún usuario/organización en particular.
+
+## DeepSeek (opcional)
+
+Quinta fuente, **nunca obligatoria**, con un propósito distinto a las
+otras cuatro: no lee observabilidad ni código, conecta con otro modelo
+de lenguaje (DeepSeek) para dos casos de uso:
+
+- **Fallback** (`ask_deepseek`): si no tienes acceso a Claude en ese
+  momento pero este MCP sigue corriendo, le haces una pregunta directa a
+  DeepSeek. Esta sí requiere `DEEPSEEK_API_KEY` — sin ningún modelo
+  configurado no hay respuesta que dar.
+- **Potenciar** (`potenciar_respuesta`): cuando tienes **ambos** modelos
+  disponibles, le pasas a esta herramienta el análisis/diagnóstico que
+  ya generó Claude (por ejemplo, tras `find_recurring_errors` +
+  `github_get_file`/`azure_repos_get_file`) y, si `DEEPSEEK_API_KEY` está
+  configurado, DeepSeek agrega su propia revisión — la respuesta queda
+  potenciada por los dos modelos. Si no está configurado, esta
+  herramienta **no falla**: devuelve el análisis de Claude tal cual, con
+  una nota de que DeepSeek se omitió por ser opcional. Es segura de
+  llamar siempre, esté o no DeepSeek disponible.
+
+Agrega a tu `.env` (opcional):
+
+```bash
+DEEPSEEK_API_KEY=tu_api_key
+DEEPSEEK_API_URL=https://api.deepseek.com/chat/completions
+DEEPSEEK_MODEL=deepseek-chat
+```
+
+Consigue tu API key en
+[platform.deepseek.com/api_keys](https://platform.deepseek.com/api_keys)
+(requiere cuenta y crédito prepago — DeepSeek cobra por token).
+
+Si dejas `DEEPSEEK_API_KEY` vacío: `ask_deepseek` deja de estar
+disponible (error claro si se intenta usar), pero `potenciar_respuesta`
+y el resto del servidor siguen funcionando exactamente igual.
 
 ## Modo experto: el archivo PLAYBOOK.md
 

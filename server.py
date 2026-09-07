@@ -85,6 +85,17 @@ AZURE_DEVOPS_API_VERSION = os.environ.get("AZURE_DEVOPS_API_VERSION", "7.1")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_API_URL = os.environ.get("GITHUB_API_URL", "https://api.github.com")
 
+# --- DeepSeek (opcional) ---
+# Quinta fuente, nunca obligatoria. No sustituye a Claude: es un modelo
+# adicional para (a) responder como fallback si no tienes acceso a
+# Claude, o (b) potenciar una respuesta que Claude ya generó, cruzándola
+# con una segunda opinión de DeepSeek — solo cuando ambos están
+# disponibles. Si DEEPSEEK_API_KEY queda vacío, el resto del servidor
+# (incluida potenciar_respuesta) sigue funcionando normal.
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+DEEPSEEK_API_URL = os.environ.get("DEEPSEEK_API_URL", "https://api.deepseek.com/chat/completions")
+DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+
 # Archivo local donde se guarda el historial de incidentes ya diagnosticados
 # y resueltos. Esto es lo que le da al agente "memoria" de casos pasados,
 # como la experiencia acumulada de un ingeniero senior.
@@ -252,6 +263,37 @@ def _azure_base_url(project: Optional[str] = None) -> str:
     if project:
         return f"https://dev.azure.com/{AZURE_DEVOPS_ORG}/{project}/_apis"
     return f"https://dev.azure.com/{AZURE_DEVOPS_ORG}/_apis"
+
+
+def _require_deepseek_config() -> None:
+    if not DEEPSEEK_API_KEY:
+        raise RuntimeError(
+            "DeepSeek no está configurado en este servidor MCP: define "
+            "DEEPSEEK_API_KEY en tu .env para usar ask_deepseek como "
+            "fallback. Esta fuente es opcional — si no la necesitas, usa "
+            "las herramientas de Datadog/AWS/Azure Repos/GitHub en su "
+            "lugar. (Nota: potenciar_respuesta NO requiere esto — "
+            "funciona igual con o sin DeepSeek configurado.)"
+        )
+
+
+def _deepseek_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+
+async def _deepseek_chat(messages: list, temperature: float = 0.3) -> str:
+    """Llamada cruda a la API de DeepSeek. No valida configuración —
+    quien la use decide si eso debe ser un error (ask_deepseek) o un
+    skip silencioso (potenciar_respuesta)."""
+    body = {"model": DEEPSEEK_MODEL, "messages": messages, "temperature": temperature}
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(DEEPSEEK_API_URL, headers=_deepseek_headers(), json=body)
+        resp.raise_for_status()
+        data = resp.json()
+    return data.get("choices", [{}])[0].get("message", {}).get("content", "")
 
 
 # ---------------------------------------------------------------------------
@@ -780,6 +822,129 @@ async def github_search_code(
         for item in data.get("items", [])
     ]
     return json.dumps(results, indent=2, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# Herramientas: DeepSeek — opcional, nunca obligatoria
+# ---------------------------------------------------------------------------
+#
+# Quinta fuente, con un propósito distinto a las otras cuatro: no lee
+# observabilidad ni código, conecta con otro modelo de lenguaje. Dos usos:
+#   - ask_deepseek: fallback. Si no hay DEEPSEEK_API_KEY, esta sí falla
+#     con un error claro — sin ningún modelo configurado no hay
+#     respuesta que dar.
+#   - potenciar_respuesta: combina. Si DeepSeek está configurado, cruza
+#     tu análisis con una segunda opinión (respuesta potenciada). Si NO
+#     está configurado, no falla — devuelve tu análisis tal cual, igual
+#     que find_recurring_errors omite una fuente no configurada en vez
+#     de fallar por completo.
+
+@mcp.tool()
+async def ask_deepseek(
+    prompt: str, system_prompt: Optional[str] = None, temperature: float = 0.3
+) -> str:
+    """Envía una pregunta directa a la API de DeepSeek (deepseek-chat) y
+    devuelve su respuesta.
+
+    Fallback: úsala cuando no tengas acceso a Claude en ese momento pero
+    este MCP siga disponible. Si quieres combinar (no reemplazar) el
+    análisis que ya hizo Claude con una segunda opinión, usa
+    potenciar_respuesta en su lugar — esa no requiere configurar nada.
+
+    Args:
+        prompt: la pregunta o instrucción a enviar.
+        system_prompt: mensaje de sistema opcional para darle contexto/rol.
+        temperature: 0.0-2.0, qué tan determinista (bajo) o creativa
+            (alto) debe ser la respuesta. Por defecto 0.3.
+
+    Requiere DEEPSEEK_API_KEY configurado en el .env (fuente opcional —
+    consigue una API key en https://platform.deepseek.com/api_keys).
+    """
+    _require_deepseek_config()
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+
+    answer = await _deepseek_chat(messages, temperature=temperature)
+    return json.dumps(
+        {"answer": answer, "model": DEEPSEEK_MODEL}, indent=2, ensure_ascii=False
+    )
+
+
+@mcp.tool()
+async def potenciar_respuesta(analisis: str, pregunta: str = "", contexto: str = "") -> str:
+    """Potencia un análisis/diagnóstico que ya generaste (Claude)
+    combinándolo con una segunda opinión de DeepSeek — solo cuando
+    DeepSeek esté disponible. NUNCA es obligatorio configurar DeepSeek
+    para usar esta herramienta.
+
+    Si DEEPSEEK_API_KEY está configurado: le pide a DeepSeek que revise
+    tu análisis y devuelve ambas perspectivas (`combined: true`) —
+    coincidencias, alternativas no consideradas, riesgos que falten.
+
+    Si DEEPSEEK_API_KEY NO está configurado: no falla — devuelve tu
+    propio análisis tal cual (`combined: false`) con una nota de que
+    DeepSeek se omitió por ser una fuente opcional, igual que
+    find_recurring_errors reporta una fuente omitida en vez de fallar
+    por completo. Es seguro llamarla siempre, esté o no DeepSeek
+    configurado.
+
+    Args:
+        analisis: el diagnóstico, causa raíz o fix que ya propusiste.
+        pregunta: la pregunta u objetivo original (opcional, da más
+            contexto a DeepSeek si está disponible).
+        contexto: contexto adicional opcional (mensaje de error,
+            fragmento de código, etc.).
+    """
+    if not DEEPSEEK_API_KEY:
+        return json.dumps(
+            {
+                "combined": False,
+                "claude_analysis": analisis,
+                "deepseek_analysis": None,
+                "note": (
+                    "DeepSeek no está configurado (DEEPSEEK_API_KEY vacío) — "
+                    "es una fuente opcional, esto no es un error. La "
+                    "respuesta se queda solo con tu análisis. Define "
+                    "DEEPSEEK_API_KEY en el .env si quieres potenciarla con "
+                    "una segunda opinión."
+                ),
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    system_prompt = (
+        "Eres un ingeniero de software senior dando una segunda opinión "
+        "sobre un análisis que ya hizo otro modelo de IA (Claude) para un "
+        "incidente de producción. No repitas el análisis con otras "
+        "palabras: señala específicamente (1) si la causa raíz parece "
+        "correcta o hay una explicación alternativa más probable, (2) "
+        "riesgos o efectos secundarios no mencionados, y (3) si falta "
+        "información antes de aplicar el cambio con confianza."
+    )
+    prompt = f"Pregunta/objetivo original: {pregunta}\n\n" if pregunta else ""
+    prompt += f"Análisis de Claude a revisar:\n{analisis}"
+    if contexto:
+        prompt += f"\n\nContexto adicional:\n{contexto}"
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": prompt},
+    ]
+    deepseek_review = await _deepseek_chat(messages, temperature=0.2)
+
+    return json.dumps(
+        {
+            "combined": True,
+            "claude_analysis": analisis,
+            "deepseek_analysis": deepseek_review,
+            "note": "Respuesta potenciada: Claude + DeepSeek (deepseek-chat).",
+        },
+        indent=2,
+        ensure_ascii=False,
+    )
 
 
 # ---------------------------------------------------------------------------
