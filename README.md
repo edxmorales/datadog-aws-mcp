@@ -58,7 +58,7 @@ para que el servidor tenga algo que consultar.
 | AWS CloudWatch | `AWS_REGION` | Credenciales AWS estándar (`aws configure`, env vars, o rol) | [Ver abajo](#aws-cloudwatch-opcional) |
 | Azure Repos | `AZURE_DEVOPS_ORG`, `AZURE_DEVOPS_PAT` | PAT de Azure DevOps, scope "Code (Read)" | [Ver abajo](#azure-repos-opcional) |
 | GitHub | `GITHUB_TOKEN` (opcional), `GITHUB_API_URL` | Nada para repos públicos; PAT fine-grained "Contents: Read-only" para privados | [Ver abajo](#github-opcional) |
-| DeepSeek | `DEEPSEEK_API_KEY`, `DEEPSEEK_API_URL`, `DEEPSEEK_MODEL` | API key de DeepSeek (nunca obligatoria) | [Ver abajo](#deepseek-opcional) |
+| DeepSeek | `DEEPSEEK_API_KEY`, `DEEPSEEK_TIER` (`paid`/`free`), `DEEPSEEK_API_URL`, `DEEPSEEK_MODEL` | API key de DeepSeek (o de Groq si usas `DEEPSEEK_TIER=free`) — nunca obligatoria | [Ver abajo](#deepseek-opcional) |
 
 Deja vacías las variables de la fuente que no uses — el resto del
 servidor sigue funcionando igual. Combina las que quieras: por ejemplo
@@ -262,18 +262,39 @@ de lenguaje (DeepSeek) para dos casos de uso:
 Agrega a tu `.env` (opcional):
 
 ```bash
+DEEPSEEK_TIER=paid
 DEEPSEEK_API_KEY=tu_api_key
-DEEPSEEK_API_URL=https://api.deepseek.com/chat/completions
-DEEPSEEK_MODEL=deepseek-chat
 ```
 
 Consigue tu API key en
 [platform.deepseek.com/api_keys](https://platform.deepseek.com/api_keys)
-(requiere cuenta y crédito prepago — DeepSeek cobra por token).
+(requiere cuenta y crédito prepago — **la API de DeepSeek no tiene capa
+gratuita**, solo su web/app de chat, que no sirve aquí).
 
-Si dejas `DEEPSEEK_API_KEY` vacío: `ask_deepseek` deja de estar
-disponible (error claro si se intenta usar), pero `potenciar_respuesta`
-y el resto del servidor siguen funcionando exactamente igual.
+### ¿Y si no quiero pagar? — `DEEPSEEK_TIER=free`
+
+Si prefieres no gastar nada, pon `DEEPSEEK_TIER=free` en tu `.env`. Esto
+NO activa una capa gratuita de DeepSeek (no existe) — en su lugar, hace
+que `ask_deepseek` y `potenciar_respuesta` llamen a **Groq**, que sí
+tiene una capa gratuita real, usando el mismo formato de API. En este
+modo, `DEEPSEEK_API_KEY` debe llevar tu key de Groq (créala gratis en
+[console.groq.com/keys](https://console.groq.com/keys)), no una de
+DeepSeek — el nombre de la variable se mantiene para no romper el resto
+del código.
+
+```bash
+DEEPSEEK_TIER=free
+DEEPSEEK_API_KEY=tu_api_key_de_groq
+```
+
+Si quieres apuntar a un proveedor o modelo distinto en cualquiera de los
+dos modos, define `DEEPSEEK_API_URL`/`DEEPSEEK_MODEL` explícitamente —
+esos valores siempre tienen prioridad sobre el default de `DEEPSEEK_TIER`.
+
+Si dejas `DEEPSEEK_API_KEY` vacío (en cualquier tier): `ask_deepseek`
+deja de estar disponible (error claro si se intenta usar), pero
+`potenciar_respuesta` y el resto del servidor siguen funcionando
+exactamente igual.
 
 ## Modo experto: el archivo PLAYBOOK.md
 

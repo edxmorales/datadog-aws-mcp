@@ -92,9 +92,32 @@ GITHUB_API_URL = os.environ.get("GITHUB_API_URL", "https://api.github.com")
 # con una segunda opinión de DeepSeek — solo cuando ambos están
 # disponibles. Si DEEPSEEK_API_KEY queda vacío, el resto del servidor
 # (incluida potenciar_respuesta) sigue funcionando normal.
+# DEEPSEEK_TIER decide qué endpoint/modelo se usa POR DEFECTO cuando NO
+# defines DEEPSEEK_API_URL/DEEPSEEK_MODEL explícitamente:
+#   - "paid" (por defecto): la API oficial de pago de DeepSeek
+#     (api.deepseek.com, modelo deepseek-chat). Es la única forma de usar
+#     DeepSeek de verdad — su API no tiene capa gratuita, solo su web/app
+#     de chat la tiene, y esa no es utilizable aquí.
+#   - "free": en vez de DeepSeek, apunta estas mismas herramientas
+#     (ask_deepseek / potenciar_respuesta) a un proveedor con capa
+#     gratuita real y compatible con el mismo formato de API (Groq, por
+#     defecto). En este modo, DEEPSEEK_API_KEY debe ser la key de ESE
+#     proveedor (ej. tu key de Groq), no una de DeepSeek — el nombre de
+#     la variable se mantiene para no romper el resto del código.
+# En ambos casos, si defines DEEPSEEK_API_URL/DEEPSEEK_MODEL a mano, esos
+# valores explícitos ganan sobre el default que ponga DEEPSEEK_TIER.
+DEEPSEEK_TIER = os.environ.get("DEEPSEEK_TIER", "paid").strip().lower()
+
+if DEEPSEEK_TIER == "free":
+    _DEEPSEEK_DEFAULT_URL = "https://api.groq.com/openai/v1/chat/completions"
+    _DEEPSEEK_DEFAULT_MODEL = "llama-3.3-70b-versatile"
+else:
+    _DEEPSEEK_DEFAULT_URL = "https://api.deepseek.com/chat/completions"
+    _DEEPSEEK_DEFAULT_MODEL = "deepseek-chat"
+
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
-DEEPSEEK_API_URL = os.environ.get("DEEPSEEK_API_URL", "https://api.deepseek.com/chat/completions")
-DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+DEEPSEEK_API_URL = os.environ.get("DEEPSEEK_API_URL", _DEEPSEEK_DEFAULT_URL)
+DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", _DEEPSEEK_DEFAULT_MODEL)
 
 # Archivo local donde se guarda el historial de incidentes ya diagnosticados
 # y resueltos. Esto es lo que le da al agente "memoria" de casos pasados,
@@ -868,7 +891,9 @@ async def ask_deepseek(
 
     answer = await _deepseek_chat(messages, temperature=temperature)
     return json.dumps(
-        {"answer": answer, "model": DEEPSEEK_MODEL}, indent=2, ensure_ascii=False
+        {"answer": answer, "model": DEEPSEEK_MODEL, "tier": DEEPSEEK_TIER},
+        indent=2,
+        ensure_ascii=False,
     )
 
 
@@ -903,12 +928,14 @@ async def potenciar_respuesta(analisis: str, pregunta: str = "", contexto: str =
                 "combined": False,
                 "claude_analysis": analisis,
                 "deepseek_analysis": None,
+                "tier": DEEPSEEK_TIER,
                 "note": (
                     "DeepSeek no está configurado (DEEPSEEK_API_KEY vacío) — "
                     "es una fuente opcional, esto no es un error. La "
                     "respuesta se queda solo con tu análisis. Define "
                     "DEEPSEEK_API_KEY en el .env si quieres potenciarla con "
-                    "una segunda opinión."
+                    "una segunda opinión (o define DEEPSEEK_TIER=free para "
+                    "usar un proveedor gratuito en su lugar)."
                 ),
             },
             indent=2,
@@ -940,7 +967,9 @@ async def potenciar_respuesta(analisis: str, pregunta: str = "", contexto: str =
             "combined": True,
             "claude_analysis": analisis,
             "deepseek_analysis": deepseek_review,
-            "note": "Respuesta potenciada: Claude + DeepSeek (deepseek-chat).",
+            "tier": DEEPSEEK_TIER,
+            "model": DEEPSEEK_MODEL,
+            "note": f"Respuesta potenciada: Claude + {DEEPSEEK_MODEL} (tier: {DEEPSEEK_TIER}).",
         },
         indent=2,
         ensure_ascii=False,
