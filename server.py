@@ -110,7 +110,7 @@ DEEPSEEK_TIER = os.environ.get("DEEPSEEK_TIER", "paid").strip().lower()
 
 if DEEPSEEK_TIER == "free":
     _DEEPSEEK_DEFAULT_URL = "https://api.groq.com/openai/v1/chat/completions"
-    _DEEPSEEK_DEFAULT_MODEL = "llama-3.3-70b-versatile"
+    _DEEPSEEK_DEFAULT_MODEL = "openai/gpt-oss-120b"
 else:
     _DEEPSEEK_DEFAULT_URL = "https://api.deepseek.com/chat/completions"
     _DEEPSEEK_DEFAULT_MODEL = "deepseek-chat"
