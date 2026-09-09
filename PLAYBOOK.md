@@ -41,7 +41,11 @@ Antes de tocar código, escribe un diagnóstico breve que incluya:
   descartaste, dilo — esto es lo que distingue un diagnóstico "senior"
   de uno superficial.
 - **Clasificación**: `code_fix`, `infra_fix`, `config_fix`,
-  `external_dependency`, `false_positive`, o `needs_human_review`.
+  `external_dependency`, `false_positive`, `inconclusive` (agotaste las
+  fuentes y la evidencia no alcanza para confirmar ninguna hipótesis —
+  distinto de `needs_human_review`, que es cuando la causa SÍ quedó
+  clara pero requiere una decisión/acción humana), o
+  `needs_human_review`.
 
 Si la clasificación NO es `code_fix`, detente aquí, registra el
 incidente con `record_incident_resolution` y notifica al humano — no
@@ -82,3 +86,9 @@ incidente correspondiente llamando de nuevo a `record_incident_resolution`
 con el mismo `fingerprint` y `outcome` actualizado (`merged`, `reverted`,
 etc.) — esto es lo que hace que el historial sea confiable para el
 futuro.
+
+Si en ese seguimiento el humano te dice que la causa raíz real era otra
+(no la que diagnosticaste), eso pesa más que tu diagnóstico original —
+regístralo con el mismo `fingerprint`, `outcome="corrected"`, y el
+`root_cause` correcto que te dieron. Las próximas veces que investigues
+algo con ese fingerprint, esa entrada corregida manda sobre la primera.
