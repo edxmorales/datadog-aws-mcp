@@ -138,7 +138,12 @@ mcp = FastMCP("datadog-aws-integration")
 # Ajustable con MCP_LOG_LEVEL=DEBUG|INFO|WARNING en el .env.
 # ---------------------------------------------------------------------------
 _LOG_PATH = Path(__file__).parent / "mcp_server.log"
-_LOG_LEVEL = os.environ.get("MCP_LOG_LEVEL", "DEBUG").upper()
+# Por defecto INFO, no DEBUG: en DEBUG, botocore registra el header
+# Authorization completo de cada request AWS (incluye tu Access Key ID
+# en texto plano, aunque no el secret) en mcp_server.log. Súbelo a DEBUG
+# solo mientras depures algo puntual (MCP_LOG_LEVEL=DEBUG en el .env), no
+# lo dejes así de forma permanente.
+_LOG_LEVEL = os.environ.get("MCP_LOG_LEVEL", "INFO").upper()
 
 # OJO: NO usar logging.basicConfig() aquí — la librería `mcp` ya configura
 # su propio handler en el logger raíz al importarse (por eso ves logs con
