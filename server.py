@@ -138,16 +138,29 @@ mcp = FastMCP("datadog-aws-integration")
 # Ajustable con MCP_LOG_LEVEL=DEBUG|INFO|WARNING en el .env.
 # ---------------------------------------------------------------------------
 _LOG_PATH = Path(__file__).parent / "mcp_server.log"
-logging.basicConfig(
-    level=os.environ.get("MCP_LOG_LEVEL", "DEBUG").upper(),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stderr),
-        logging.FileHandler(_LOG_PATH, encoding="utf-8"),
-    ],
-)
+_LOG_LEVEL = os.environ.get("MCP_LOG_LEVEL", "DEBUG").upper()
+
+# OJO: NO usar logging.basicConfig() aquí — la librería `mcp` ya configura
+# su propio handler en el logger raíz al importarse (por eso ves logs con
+# formato "[HH:MM:SS] INFO ..." en la consola incluso sin este bloque).
+# basicConfig() es un no-op silencioso si el logger raíz YA tiene handlers,
+# así que usarlo hacía que este archivo de log se quedara vacío para
+# siempre, sin ningún error visible. En vez de eso, agregamos nuestro
+# propio handler de archivo directamente — así conservamos el handler de
+# consola que ya trae `mcp` y además escribimos a `mcp_server.log`.
+_root_logger = logging.getLogger()
+if not _root_logger.handlers:
+    # Por si en el futuro `mcp` deja de configurar logging por su cuenta,
+    # garantizamos al menos salida por stderr.
+    _stderr_handler = logging.StreamHandler(sys.stderr)
+    _stderr_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    _root_logger.addHandler(_stderr_handler)
+_file_handler = logging.FileHandler(_LOG_PATH, encoding="utf-8")
+_file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+_root_logger.addHandler(_file_handler)
+_root_logger.setLevel(_LOG_LEVEL)
 logger = logging.getLogger("datadog-aws-mcp")
-logging.getLogger("httpx").setLevel(os.environ.get("MCP_LOG_LEVEL", "DEBUG").upper())
+logging.getLogger("httpx").setLevel(_LOG_LEVEL)
 logging.getLogger("httpcore").setLevel(logging.INFO)  # httpcore en DEBUG es MUY verboso
 
 
