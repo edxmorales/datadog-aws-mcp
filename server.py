@@ -45,7 +45,9 @@ salvo que quieras usar esa fuente en particular:
 """
 
 import base64
+import logging
 import os
+import sys
 import time
 import json
 import hashlib
@@ -56,6 +58,7 @@ from typing import Optional
 
 import httpx
 import boto3
+from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
@@ -128,6 +131,25 @@ INCIDENT_HISTORY_PATH = Path(
 
 mcp = FastMCP("datadog-aws-integration")
 
+# ---------------------------------------------------------------------------
+# Logging: stdout está reservado para el protocolo JSON-RPC de MCP, así que
+# TODO log va a stderr (visible en la terminal / en el host MCP) y además a
+# un archivo local para poder revisar después de que el proceso se cierre.
+# Ajustable con MCP_LOG_LEVEL=DEBUG|INFO|WARNING en el .env.
+# ---------------------------------------------------------------------------
+_LOG_PATH = Path(__file__).parent / "mcp_server.log"
+logging.basicConfig(
+    level=os.environ.get("MCP_LOG_LEVEL", "DEBUG").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stderr),
+        logging.FileHandler(_LOG_PATH, encoding="utf-8"),
+    ],
+)
+logger = logging.getLogger("datadog-aws-mcp")
+logging.getLogger("httpx").setLevel(os.environ.get("MCP_LOG_LEVEL", "DEBUG").upper())
+logging.getLogger("httpcore").setLevel(logging.INFO)  # httpcore en DEBUG es MUY verboso
+
 
 def _load_history() -> list:
     if not INCIDENT_HISTORY_PATH.exists():
@@ -167,6 +189,20 @@ def _dd_headers() -> dict:
     }
 
 
+# boto3 no trae timeout por defecto razonable (60s conexión + 60s lectura,
+# con reintentos) — si AWS no es alcanzable (VPN caída, región sin salida,
+# firewall que dropea el SYN), una sola llamada puede colgarse varios
+# minutos. Como el server MCP procesa las tool calls una por una, eso
+# congela TODO el servidor (incluidas tools de Datadog/GitHub sin relación),
+# hasta que el cliente se harta y cierra la conexión. Con esto, falla rápido
+# y claro en vez de colgar el proceso entero.
+_AWS_CLIENT_CONFIG = Config(
+    connect_timeout=5,
+    read_timeout=10,
+    retries={"max_attempts": 2, "mode": "standard"},
+)
+
+
 def _cloudwatch_client():
     """Crea el cliente de boto3 para CloudWatch Logs, traduciendo errores
     de credenciales/permisos a un mensaje claro (AWS es una fuente
@@ -174,7 +210,7 @@ def _cloudwatch_client():
     locate credentials" que no dicen qué hacer al respecto).
     """
     try:
-        client = boto3.client("logs", region_name=AWS_REGION)
+        client = boto3.client("logs", region_name=AWS_REGION, config=_AWS_CLIENT_CONFIG)
         # boto3 no valida credenciales al crear el cliente; forzamos una
         # llamada barata para detectar el problema aquí, en un solo lugar.
         client.describe_log_groups(limit=1)
@@ -205,7 +241,7 @@ def _ec2_client():
     UnauthorizedOperation — lo traducimos aquí a un mensaje claro.
     """
     try:
-        client = boto3.client("ec2", region_name=AWS_REGION)
+        client = boto3.client("ec2", region_name=AWS_REGION, config=_AWS_CLIENT_CONFIG)
         client.describe_nat_gateways(MaxResults=5)
         return client
     except (BotoCoreError, ClientError) as e:
@@ -230,7 +266,7 @@ def _elbv2_client():
     puede no tener todavía.
     """
     try:
-        client = boto3.client("elbv2", region_name=AWS_REGION)
+        client = boto3.client("elbv2", region_name=AWS_REGION, config=_AWS_CLIENT_CONFIG)
         client.describe_load_balancers(PageSize=5)
         return client
     except (BotoCoreError, ClientError) as e:
@@ -312,7 +348,10 @@ async def _deepseek_chat(messages: list, temperature: float = 0.3) -> str:
     quien la use decide si eso debe ser un error (ask_deepseek) o un
     skip silencioso (potenciar_respuesta)."""
     body = {"model": DEEPSEEK_MODEL, "messages": messages, "temperature": temperature}
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    # 30s (antes 60s): suficiente para una respuesta larga del modelo, pero
+    # con margen de sobra frente a los ~4 min en que el cliente MCP se
+    # rinde y cierra la conexión (lo que causaba el crash original).
+    async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(DEEPSEEK_API_URL, headers=_deepseek_headers(), json=body)
         resp.raise_for_status()
         data = resp.json()
@@ -1061,6 +1100,11 @@ def check_known_incident(fingerprint: str) -> str:
     esto te ahorra tiempo y te da el diagnóstico/fix que funcionó
     (o que se intentó y no funcionó) la vez anterior.
 
+    Puede devolver varias entradas para el mismo fingerprint (una por
+    cada vez que se registró algo). Si alguna tiene outcome="corrected",
+    ESA es la autoritativa (un humano corrigió el diagnóstico original) —
+    no la primera que aparezca ni la que "suene" más completa.
+
     Args:
         fingerprint: huella del error (la que devuelven las herramientas
             de datadog_recent_errors / cloudwatch_recent_errors /
@@ -1096,9 +1140,17 @@ def record_incident_resolution(
         root_cause: causa raíz identificada (tu diagnóstico).
         resolution: qué se hizo para corregirlo (resumen del fix).
         resolution_type: uno de "code_fix", "infra_fix", "config_fix",
-            "external_dependency", "false_positive", "needs_human_review".
+            "external_dependency", "false_positive", "inconclusive"
+            (agotaste las fuentes razonables y la evidencia no alcanzó
+            para confirmar ninguna hipótesis), "needs_human_review"
+            (la causa sí quedó clara pero requiere una decisión/acción
+            humana).
         pr_url: URL del Pull Request si se creó uno.
-        outcome: "pending_review", "merged", "rejected", "reverted".
+        outcome: "pending_review", "merged", "rejected", "reverted", o
+            "corrected" — usa "corrected" cuando un humano te dice que
+            la causa raíz real fue distinta a la que diagnosticaste
+            antes; ese registro debe pesar más que uno sin corregir del
+            mismo fingerprint en futuras investigaciones.
     """
     history = _load_history()
     entry = {
@@ -1130,4 +1182,16 @@ def list_incident_history(resolution_type: Optional[str] = None, limit: int = 50
 
 
 if __name__ == "__main__":
-    mcp.run()
+    logger.info(
+        "Iniciando servidor MCP 'datadog-aws-integration' (transport=stdio, pid=%s). "
+        "Log también en: %s", os.getpid(), _LOG_PATH,
+    )
+    try:
+        mcp.run()
+    except KeyboardInterrupt:
+        logger.info("Detenido manualmente (Ctrl+C).")
+    except Exception:
+        logger.exception("El servidor se cayó por una excepción no controlada.")
+        raise
+    finally:
+        logger.info("Servidor detenido.")
