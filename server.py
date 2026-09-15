@@ -63,6 +63,12 @@ from botocore.exceptions import BotoCoreError, ClientError
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 
+# Herramientas aditivas (no tocan las existentes):
+#   tools_waf          -> CloudWatch Logs Insights sin truncamiento
+#   tools_datadog_full -> API v2 de Datadog con atributos completos
+from tools_waf import register_waf_tools
+from tools_datadog_full import register_datadog_full_tools
+
 load_dotenv()
 
 # --- Datadog (opcional) ---
@@ -1198,6 +1204,13 @@ def list_incident_history(resolution_type: Optional[str] = None, limit: int = 50
     history = sorted(history, key=lambda h: h.get("recorded_at", ""), reverse=True)[:limit]
     return json.dumps(history, indent=2, ensure_ascii=False)
 
+
+# ---------------------------------------------------------------------------
+# Registro de las herramientas aditivas. Se hace aquí, con el resto de tools
+# ya definidas y antes de mcp.run(), para no alterar nada de lo existente.
+# ---------------------------------------------------------------------------
+register_waf_tools(mcp)
+register_datadog_full_tools(mcp)
 
 if __name__ == "__main__":
     logger.info(
