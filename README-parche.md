@@ -100,3 +100,56 @@ sportsbook de Altenar se carga como widget desde un dominio del proveedor, el
 navegador del jugador pega directo contra Altenar y ese tráfico nunca toca tu
 WAF. En ese caso el canal y el dispositivo por apuesta hay que sacarlos del
 backoffice de Altenar, no de aquí.
+
+---
+
+# Consumo de tokens
+
+Todo lo que devuelve una tool entra en la ventana de contexto del modelo y se
+vuelve a enviar en cada turno siguiente. Hay dos costos distintos:
+
+## 1. Costo fijo: los esquemas de las tools
+
+Las 24 tools registradas ocupan **~24.000 caracteres (~6.900 tokens)** de
+descripciones y esquemas, y ese bloque viaja en *cada* request, se usen o no.
+Es el piso del servidor. Si no usas DeepSeek (`ask_deepseek`,
+`potenciar_respuesta`) o Azure Repos, no registrar esas tools baja el piso
+alrededor de un 25%.
+
+## 2. Costo variable: las respuestas
+
+Aquí estaba el problema real. `cloudwatch_recent_errors` paginaba hasta 500
+eventos de 500 caracteres y los devolvía todos, con `indent=2`: ~143.000
+caracteres, del orden de 40.000 tokens en una sola llamada — y casi todo
+repetido, porque el mismo stack trace aparece cientos de veces.
+
+Cambios aplicados:
+
+- **JSON compacto.** `_dump()` serializa sin sangrado ni espacios en los
+  separadores. Se aplica a todas las respuestas (el `incident_history.json`
+  en disco sigue indentado y legible).
+- **Agrupación por fingerprint por defecto.** `datadog_recent_errors` y
+  `cloudwatch_recent_errors` devuelven un ejemplo por huella con su conteo y
+  su ventana de tiempo, en vez de cada repetición. Con `agrupar=False` vuelve
+  la lista cruda.
+- **Tope duro de respuesta.** `_cap()` recorta a `MCP_MAX_RESPONSE_CHARS`
+  (60.000 por defecto) y avisa al modelo con qué parámetro acotar, en vez de
+  reventar el contexto en silencio.
+- **Lectura de archivos acotada.** `github_get_file` y `azure_repos_get_file`
+  aceptan `max_chars` (40.000 por defecto) y `desde_linea`/`hasta_linea`, que
+  es lo que quieres cuando vienes de un stack trace con número de línea.
+- **`datadog_search_logs` con presupuesto.** Sigue sin truncar atributos —
+  ese es su propósito — pero deja de devolver eventos cuando se agota
+  `max_output_chars` y reporta cuántos quedaron fuera.
+- **Sin ida y vuelta por JSON.** `find_recurring_errors` llama ahora a
+  `_datadog_fetch` / `_cloudwatch_fetch` directamente. Antes serializaba
+  cientos de eventos a JSON solo para volver a parsearlos dentro del proceso.
+
+Medición con 500 eventos de CloudWatch y 3 errores distintos repetidos:
+
+| Respuesta | Caracteres | Tokens aprox. |
+|---|---:|---:|
+| Antes (lista cruda, `indent=2`) | 143.450 | ~41.000 |
+| Ahora, `agrupar=False` | 60.063 | ~17.000 |
+| Ahora, por defecto | 1.005 | ~290 |
+

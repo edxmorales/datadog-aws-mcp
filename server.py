@@ -175,6 +175,66 @@ logging.getLogger("httpx").setLevel(_LOG_LEVEL)
 logging.getLogger("httpcore").setLevel(logging.INFO)  # httpcore en DEBUG es MUY verboso
 
 
+# ---------------------------------------------------------------------------
+# Serialización compacta + topes de tamaño
+# ---------------------------------------------------------------------------
+#
+# Todo lo que devuelve una tool entra en la ventana de contexto del modelo.
+# Dos decisiones que ahorran tokens sin perder información:
+#   - _dump(): JSON sin indent y sin espacios tras ',' y ':'. Un listado de
+#     500 eventos pasa de ~250 KB a ~200 KB sólo por quitar el sangrado.
+#   - _cap(): tope duro de caracteres en las respuestas que pueden crecer sin
+#     control (contenido de archivos, eventos con atributos completos). En vez
+#     de reventar el contexto, se corta y se avisa al modelo de cómo acotar.
+
+_MAX_RESPONSE_CHARS = int(os.getenv("MCP_MAX_RESPONSE_CHARS", "60000"))
+
+
+def _dump(obj) -> str:
+    """JSON compacto: sin sangrado y sin espacios en los separadores."""
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
+def _cap(texto: str, limite: Optional[int] = None, pista: str = "") -> str:
+    """Corta `texto` al tope configurado y deja constancia del recorte."""
+    limite = limite or _MAX_RESPONSE_CHARS
+    if len(texto) <= limite:
+        return texto
+    aviso = (
+        f"\n\n[TRUNCADO: se recortaron {len(texto) - limite} caracteres "
+        f"({len(texto)} -> {limite})."
+    )
+    if pista:
+        aviso += f" {pista}"
+    aviso += "]"
+    return texto[:limite] + aviso
+
+
+
+def _recortar_archivo(
+    contenido: str, max_chars: int, desde_linea: int = 0, hasta_linea: int = 0
+) -> str:
+    """Acota el contenido de un archivo antes de mandarlo al contexto.
+
+    Un archivo entero embebido en JSON es de lo más caro que puede devolver
+    este servidor: cada salto de línea se escapa y no hay tope natural. Con
+    `desde_linea`/`hasta_linea` se pide sólo el trozo relevante — que es lo
+    normal cuando vienes de un stack trace con número de línea.
+    """
+    if desde_linea or hasta_linea:
+        lineas = contenido.splitlines()
+        inicio = max(0, desde_linea - 1) if desde_linea else 0
+        fin = hasta_linea if hasta_linea else len(lineas)
+        contenido = "\n".join(
+            f"{n}: {t}" for n, t in enumerate(lineas[inicio:fin], start=inicio + 1)
+        )
+    if max_chars:
+        contenido = _cap(
+            contenido, max_chars, "Pide un rango con `desde_linea`/`hasta_linea`."
+        )
+    return contenido
+
+
 def _load_history() -> list:
     if not INCIDENT_HISTORY_PATH.exists():
         return []
@@ -415,20 +475,17 @@ async def datadog_triggered_monitors() -> str:
         for m in monitors
         if m.get("overall_state") in ("Alert", "Warn")
     ]
-    return json.dumps(triggered, indent=2, ensure_ascii=False)
+    return _dump(triggered)
 
 
-@mcp.tool()
-async def datadog_recent_errors(query: str = "status:error", hours: int = 1, limit: int = 100) -> str:
-    """Busca logs de error recientes en Datadog Log Management.
+async def _datadog_fetch(query: str, hours: int, limit: int) -> list:
+    """Trae los logs de Datadog ya normalizados, SIN pasar por JSON.
 
-    Args:
-        query: query de búsqueda de Datadog (ej. "status:error service:checkout").
-        hours: ventana de tiempo hacia atrás, en horas.
-        limit: máximo de logs a devolver.
-
-    Requiere DD_API_KEY y DD_APP_KEY configurados en el .env (fuente
-    opcional).
+    Separado de la tool a propósito: find_recurring_errors consume cientos
+    de eventos para contarlos, pero esos eventos nunca deben viajar al
+    contexto del modelo. Antes esto se hacía serializando a JSON y
+    volviéndolo a parsear dentro del servidor — mismo resultado, trabajo de
+    más, y muy fácil de devolver por error.
     """
     _require_datadog_config()
     url = f"https://api.{DD_SITE}/api/v2/logs/events/search"
@@ -450,34 +507,106 @@ async def datadog_recent_errors(query: str = "status:error", hours: int = 1, lim
         resp.raise_for_status()
         data = resp.json()
 
-    logs = data.get("data", [])
     results = []
-    for log in logs:
+    for log in data.get("data", []):
         attrs = log.get("attributes", {})
         message = attrs.get("message", "")
         results.append({
             "timestamp": attrs.get("timestamp"),
             "service": attrs.get("service"),
-            "message": message[:500],
+            "message": message,
             "fingerprint": _fingerprint(message),
         })
-    return json.dumps(results, indent=2, ensure_ascii=False)
+    return results
+
+
+def _agrupar_por_fingerprint(eventos: list, max_chars: int, top: int) -> dict:
+    """Colapsa eventos repetidos en un grupo por fingerprint.
+
+    Un log de error rara vez es único: el mismo stack trace aparece cientos
+    de veces en la ventana. Devolver cada repetición cuesta tokens y no
+    aporta nada, así que se devuelve un ejemplo por huella con su conteo.
+    """
+    grupos: dict[str, dict] = {}
+    for e in eventos:
+        fp = e["fingerprint"]
+        g = grupos.get(fp)
+        if g is None:
+            grupos[fp] = {
+                "fingerprint": fp,
+                "count": 1,
+                "primera_vista": e.get("timestamp"),
+                "ultima_vista": e.get("timestamp"),
+                "service": e.get("service"),
+                "example_message": (e.get("message") or "")[:max_chars],
+            }
+        else:
+            g["count"] += 1
+            marca = e.get("timestamp")
+            if marca:
+                if not g["primera_vista"] or marca < g["primera_vista"]:
+                    g["primera_vista"] = marca
+                if not g["ultima_vista"] or marca > g["ultima_vista"]:
+                    g["ultima_vista"] = marca
+
+    ordenados = sorted(grupos.values(), key=lambda g: g["count"], reverse=True)
+    return {
+        "eventos_inspeccionados": len(eventos),
+        "grupos_totales": len(ordenados),
+        "grupos_devueltos": min(top, len(ordenados)),
+        "grupos": ordenados[:top],
+    }
+
+
+@mcp.tool()
+async def datadog_recent_errors(
+    query: str = "status:error",
+    hours: int = 1,
+    limit: int = 100,
+    max_chars: int = 300,
+    agrupar: bool = True,
+    top: int = 25,
+) -> str:
+    """Busca logs de error recientes en Datadog Log Management.
+
+    Por defecto agrupa los eventos por fingerprint y devuelve un ejemplo
+    por grupo con su conteo, que es lo que casi siempre quieres ver y cuesta
+    una fracción de los tokens de la lista cruda.
+
+    Args:
+        query: query de búsqueda de Datadog (ej. "status:error service:checkout").
+        hours: ventana de tiempo hacia atrás, en horas.
+        limit: máximo de logs a inspeccionar.
+        max_chars: caracteres de mensaje por evento (0 = mensaje completo).
+        agrupar: False devuelve la lista cruda de eventos, uno por uno.
+        top: máximo de grupos a devolver cuando agrupar=True.
+
+    Requiere DD_API_KEY y DD_APP_KEY configurados en el .env (fuente
+    opcional).
+    """
+    eventos = await _datadog_fetch(query, hours, limit)
+    if agrupar:
+        return _cap(
+            _dump(_agrupar_por_fingerprint(eventos, max_chars or 10**9, top)),
+            pista="Acota con `query` u `hours`, o baja `top`/`max_chars`.",
+        )
+    if max_chars:
+        for e in eventos:
+            e["message"] = e["message"][:max_chars]
+    return _cap(_dump(eventos), pista="Usa agrupar=True o baja `limit`.")
 
 
 # ---------------------------------------------------------------------------
 # Herramientas: AWS CloudWatch
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
-def cloudwatch_recent_errors(log_group: str, hours: int = 1, filter_pattern: str = "?ERROR ?Error ?error") -> str:
-    """Busca eventos de error recientes en un log group de CloudWatch Logs.
+def _cloudwatch_fetch(
+    log_group: str, hours: int, filter_pattern: str, max_events: int = 500
+) -> list:
+    """Trae los eventos de CloudWatch ya normalizados, sin pasar por JSON.
 
-    Args:
-        log_group: nombre del log group (ej. "/aws/lambda/mi-funcion").
-        hours: ventana de tiempo hacia atrás, en horas.
-        filter_pattern: patrón de filtro de CloudWatch Logs Insights/Filter.
-
-    Requiere credenciales de AWS configuradas (fuente opcional).
+    Mismo motivo que _datadog_fetch: find_recurring_errors necesita el
+    volumen completo para contar, el modelo no.
     """
     client = _cloudwatch_client()
     start_time = int((time.time() - hours * 3600) * 1000)
@@ -492,19 +621,60 @@ def cloudwatch_recent_errors(log_group: str, hours: int = 1, filter_pattern: str
         resp = client.filter_log_events(**kwargs)
         events.extend(resp.get("events", []))
         next_token = resp.get("nextToken")
-        if not next_token or len(events) >= 500:
+        if not next_token or len(events) >= max_events:
             break
         kwargs["nextToken"] = next_token
 
     results = []
-    for e in events:
+    for e in events[:max_events]:
         message = e.get("message", "")
         results.append({
             "timestamp": e.get("timestamp"),
-            "message": message[:500],
+            "service": None,
+            "message": message,
             "fingerprint": _fingerprint(message),
         })
-    return json.dumps(results, indent=2, ensure_ascii=False)
+    return results
+
+
+@mcp.tool()
+def cloudwatch_recent_errors(
+    log_group: str,
+    hours: int = 1,
+    filter_pattern: str = "?ERROR ?Error ?error",
+    limit: int = 500,
+    max_chars: int = 300,
+    agrupar: bool = True,
+    top: int = 25,
+) -> str:
+    """Busca eventos de error recientes en un log group de CloudWatch Logs.
+
+    Por defecto agrupa por fingerprint y devuelve un ejemplo por grupo con
+    su conteo. Sin agrupar, este log group puede devolver 500 eventos de
+    hasta 500 caracteres cada uno: decenas de miles de tokens en una sola
+    llamada, casi todos repetidos.
+
+    Args:
+        log_group: nombre del log group (ej. "/aws/lambda/mi-funcion").
+        hours: ventana de tiempo hacia atrás, en horas.
+        filter_pattern: patrón de filtro de CloudWatch Logs Insights/Filter.
+        limit: máximo de eventos a inspeccionar.
+        max_chars: caracteres de mensaje por evento (0 = mensaje completo).
+        agrupar: False devuelve la lista cruda de eventos, uno por uno.
+        top: máximo de grupos a devolver cuando agrupar=True.
+
+    Requiere credenciales de AWS configuradas (fuente opcional).
+    """
+    eventos = _cloudwatch_fetch(log_group, hours, filter_pattern, max_events=limit)
+    if agrupar:
+        return _cap(
+            _dump(_agrupar_por_fingerprint(eventos, max_chars or 10**9, top)),
+            pista="Acota con `filter_pattern` u `hours`, o baja `top`/`max_chars`.",
+        )
+    if max_chars:
+        for e in eventos:
+            e["message"] = e["message"][:max_chars]
+    return _cap(_dump(eventos), pista="Usa agrupar=True o baja `limit`.")
 
 
 @mcp.tool()
@@ -520,7 +690,7 @@ def cloudwatch_list_log_groups(prefix: Optional[str] = None) -> str:
         kwargs["logGroupNamePrefix"] = prefix
     resp = client.describe_log_groups(**kwargs)
     groups = [g["logGroupName"] for g in resp.get("logGroups", [])]
-    return json.dumps(groups, indent=2, ensure_ascii=False)
+    return _dump(groups)
 
 
 @mcp.tool()
@@ -578,7 +748,7 @@ def aws_network_egress_ips(name_filter: Optional[str] = None) -> str:
             "public_ips": public_ips,
         })
 
-    return json.dumps(results, indent=2, ensure_ascii=False)
+    return _dump(results)
 
 
 @mcp.tool()
@@ -616,7 +786,7 @@ def aws_list_load_balancers(name_filter: Optional[str] = None) -> str:
             "state": lb.get("State", {}).get("Code"),
         })
 
-    return json.dumps(results, indent=2, ensure_ascii=False)
+    return _dump(results)
 
 
 # ---------------------------------------------------------------------------
@@ -654,7 +824,7 @@ async def azure_devops_list_projects() -> str:
         data = resp.json()
 
     projects = [{"id": p["id"], "name": p["name"]} for p in data.get("value", [])]
-    return json.dumps(projects, indent=2, ensure_ascii=False)
+    return _dump(projects)
 
 
 @mcp.tool()
@@ -682,12 +852,13 @@ async def azure_repos_list_repos(project: str) -> str:
         }
         for r in data.get("value", [])
     ]
-    return json.dumps(repos, indent=2, ensure_ascii=False)
+    return _dump(repos)
 
 
 @mcp.tool()
 async def azure_repos_get_file(
-    project: str, repository: str, path: str, branch: Optional[str] = None
+    project: str, repository: str, path: str, branch: Optional[str] = None,
+    max_chars: int = 40000, desde_linea: int = 0, hasta_linea: int = 0,
 ) -> str:
     """Obtiene el contenido de un archivo de un repo de Azure Repos.
 
@@ -727,10 +898,8 @@ async def azure_repos_get_file(
         except UnicodeDecodeError:
             content = "<archivo binario, no se puede mostrar como texto>"
 
-    return json.dumps(
-        {"path": path, "content": content},
-        indent=2,
-        ensure_ascii=False,
+    return _dump(
+        {"path": path, "content": _recortar_archivo(content, max_chars, desde_linea, hasta_linea)}
     )
 
 
@@ -776,7 +945,7 @@ async def azure_repos_search_code(
         }
         for r in data.get("results", [])
     ]
-    return json.dumps(results, indent=2, ensure_ascii=False)
+    return _dump(results)
 
 
 # ---------------------------------------------------------------------------
@@ -832,11 +1001,14 @@ async def github_list_repos(owner: str) -> str:
         }
         for r in data
     ]
-    return json.dumps(repos, indent=2, ensure_ascii=False)
+    return _dump(repos)
 
 
 @mcp.tool()
-async def github_get_file(owner: str, repo: str, path: str, ref: Optional[str] = None) -> str:
+async def github_get_file(
+    owner: str, repo: str, path: str, ref: Optional[str] = None,
+    max_chars: int = 40000, desde_linea: int = 0, hasta_linea: int = 0,
+) -> str:
     """Obtiene el contenido de un archivo de un repo de GitHub.
 
     Útil para leer el código fuente real al diagnosticar un error (ej.
@@ -861,8 +1033,11 @@ async def github_get_file(owner: str, repo: str, path: str, ref: Optional[str] =
     if data.get("encoding") == "base64" and content:
         content = base64.b64decode(content).decode("utf-8", errors="replace")
 
-    return json.dumps(
-        {"path": data.get("path", path), "content": content}, indent=2, ensure_ascii=False
+    return _dump(
+        {
+            "path": data.get("path", path),
+            "content": _recortar_archivo(content, max_chars, desde_linea, hasta_linea),
+        }
     )
 
 
@@ -907,7 +1082,7 @@ async def github_search_code(
         {"file": item.get("path"), "repository": item.get("repository", {}).get("full_name")}
         for item in data.get("items", [])
     ]
-    return json.dumps(results, indent=2, ensure_ascii=False)
+    return _dump(results)
 
 
 # ---------------------------------------------------------------------------
@@ -953,11 +1128,7 @@ async def ask_deepseek(
     messages.append({"role": "user", "content": prompt})
 
     answer = await _deepseek_chat(messages, temperature=temperature)
-    return json.dumps(
-        {"answer": answer, "model": DEEPSEEK_MODEL, "tier": DEEPSEEK_TIER},
-        indent=2,
-        ensure_ascii=False,
-    )
+    return _dump({"answer": answer, "model": DEEPSEEK_MODEL, "tier": DEEPSEEK_TIER})
 
 
 @mcp.tool()
@@ -986,8 +1157,7 @@ async def potenciar_respuesta(analisis: str, pregunta: str = "", contexto: str =
             fragmento de código, etc.).
     """
     if not DEEPSEEK_API_KEY:
-        return json.dumps(
-            {
+        return _dump({
                 "combined": False,
                 "claude_analysis": analisis,
                 "deepseek_analysis": None,
@@ -1000,10 +1170,7 @@ async def potenciar_respuesta(analisis: str, pregunta: str = "", contexto: str =
                     "una segunda opinión (o define DEEPSEEK_TIER=free para "
                     "usar un proveedor gratuito en su lugar)."
                 ),
-            },
-            indent=2,
-            ensure_ascii=False,
-        )
+            })
 
     system_prompt = (
         "Eres un ingeniero de software senior dando una segunda opinión "
@@ -1025,7 +1192,7 @@ async def potenciar_respuesta(analisis: str, pregunta: str = "", contexto: str =
     ]
     deepseek_review = await _deepseek_chat(messages, temperature=0.2)
 
-    return json.dumps(
+    return _dump(
         {
             "combined": True,
             "claude_analysis": analisis,
@@ -1033,9 +1200,7 @@ async def potenciar_respuesta(analisis: str, pregunta: str = "", contexto: str =
             "tier": DEEPSEEK_TIER,
             "model": DEEPSEEK_MODEL,
             "note": f"Respuesta potenciada: Claude + {DEEPSEEK_MODEL} (tier: {DEEPSEEK_TIER}).",
-        },
-        indent=2,
-        ensure_ascii=False,
+        }
     )
 
 
@@ -1049,6 +1214,8 @@ async def find_recurring_errors(
     log_group: Optional[str] = None,
     hours: int = 24,
     min_occurrences: int = 3,
+    max_chars: int = 500,
+    top: int = 30,
 ) -> str:
     """Combina Datadog + CloudWatch — las fuentes que estén configuradas —
     y agrupa errores por 'fingerprint' para detectar cuáles son
@@ -1069,8 +1236,7 @@ async def find_recurring_errors(
 
     if DD_API_KEY and DD_APP_KEY:
         try:
-            dd_raw = await datadog_recent_errors(query=datadog_query, hours=hours, limit=500)
-            for item in json.loads(dd_raw):
+            for item in await _datadog_fetch(datadog_query, hours, 500):
                 all_messages.append((item["fingerprint"], item["message"], "datadog"))
         except Exception as e:
             skipped_sources.append({"source": "datadog", "reason": str(e)})
@@ -1079,8 +1245,7 @@ async def find_recurring_errors(
 
     if log_group:
         try:
-            cw_raw = cloudwatch_recent_errors(log_group=log_group, hours=hours)
-            for item in json.loads(cw_raw):
+            for item in _cloudwatch_fetch(log_group, hours, "?ERROR ?Error ?error"):
                 all_messages.append((item["fingerprint"], item["message"], "cloudwatch"))
         except Exception as e:
             skipped_sources.append({"source": "cloudwatch", "reason": str(e)})
@@ -1098,17 +1263,25 @@ async def find_recurring_errors(
         {
             "fingerprint": fp,
             "count": count,
-            "example_message": examples[fp],
+            # Recortado aquí: los fetchers devuelven el mensaje completo
+            # porque find_recurring_errors los usa para contar, no para
+            # mostrarlos. Lo que sale al contexto sí se acota.
+            "example_message": examples[fp][:max_chars] if max_chars else examples[fp],
             "sources": list(sources[fp]),
         }
         for fp, count in counter.items()
         if count >= min_occurrences
     ]
     recurring.sort(key=lambda x: x["count"], reverse=True)
-    return json.dumps(
-        {"recurring": recurring, "skipped_sources": skipped_sources},
-        indent=2,
-        ensure_ascii=False,
+    return _cap(
+        _dump(
+            {
+                "recurring": recurring[:top],
+                "grupos_totales": len(recurring),
+                "skipped_sources": skipped_sources,
+            }
+        ),
+        pista="Sube `min_occurrences` o baja `top`/`max_chars`.",
     )
 
 
@@ -1137,8 +1310,8 @@ def check_known_incident(fingerprint: str) -> str:
     history = _load_history()
     matches = [inc for inc in history if inc.get("fingerprint") == fingerprint]
     if not matches:
-        return json.dumps({"found": False, "message": "Sin incidentes previos con este fingerprint."})
-    return json.dumps({"found": True, "incidents": matches}, indent=2, ensure_ascii=False)
+        return _dump({"found": False, "message": "Sin incidentes previos con este fingerprint."})
+    return _dump({"found": True, "incidents": matches})
 
 
 @mcp.tool()
@@ -1189,7 +1362,7 @@ def record_incident_resolution(
     }
     history.append(entry)
     _save_history(history)
-    return json.dumps({"saved": True, "entry": entry}, indent=2, ensure_ascii=False)
+    return _dump({"saved": True, "entry": entry})
 
 
 @mcp.tool()
@@ -1202,7 +1375,7 @@ def list_incident_history(resolution_type: Optional[str] = None, limit: int = 50
     if resolution_type:
         history = [h for h in history if h.get("resolution_type") == resolution_type]
     history = sorted(history, key=lambda h: h.get("recorded_at", ""), reverse=True)[:limit]
-    return json.dumps(history, indent=2, ensure_ascii=False)
+    return _dump(history)
 
 
 # ---------------------------------------------------------------------------

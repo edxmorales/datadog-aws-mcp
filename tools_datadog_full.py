@@ -38,6 +38,11 @@ from typing import Any, Optional
 
 _TIMEOUT_SECONDS = 45
 
+# Presupuesto de tamaño de las respuestas que ve el modelo. Estas tools
+# devuelven atributos completos, así que sin tope una sola llamada puede
+# llenar la ventana de contexto. Ajustable con MCP_MAX_RESPONSE_CHARS.
+_MAX_OUTPUT_CHARS = int(os.getenv("MCP_MAX_RESPONSE_CHARS", "60000"))
+
 # Cabeceras donde suele venir la IP real del cliente detrás del ingress.
 _IP_HEADERS = ("x-forwarded-for", "x-real-ip", "cf-connecting-ip", "true-client-ip")
 
@@ -119,29 +124,17 @@ def _primera_ip_publica(valor: str) -> Optional[str]:
 def register_datadog_full_tools(mcp) -> None:
     """Registra las herramientas de Datadog sin truncamiento."""
 
-    @mcp.tool()
-    def datadog_search_logs(
-        query: str = "*",
-        hours: int = 2,
-        limit: int = 50,
-        campos: str = "",
-        max_message_chars: int = 0,
+    def _buscar(
+        query: str, hours: int, limit: int, campos: str, max_message_chars: int
     ) -> dict:
-        """
-        Busca logs en Datadog y devuelve los ATRIBUTOS COMPLETOS de cada
-        evento, no solo el mensaje.
+        """Cuerpo de la búsqueda, sin tope de salida.
 
-        Úsala cuando necesites campos que datadog_recent_errors descarta:
-        @email, playerId, clientIp, requestHeaders, status codes, etc.
-
-        Args:
-            query: query de Datadog (ej. 'service:back-security @email:x@y.com').
-            hours: ventana hacia atrás, en horas.
-            limit: máximo de eventos (tope 1000 por página en la API).
-            campos: lista separada por comas de atributos a proyectar
-                    (ej. 'playerId,http.url,network.client.ip'). Vacío = todos.
-            max_message_chars: 0 = mensaje completo. Un número > 0 lo recorta
-                    a esa cantidad de caracteres.
+        Separado de la tool porque datadog_client_ips necesita inspeccionar
+        cientos de eventos para agrupar IPs, pero no devuelve ninguno al
+        modelo. La tool pública sí aplica tope: cada evento lleva los
+        atributos aplanados completos (headers incluidos) y uno solo de
+        WAF/ingress puede pasar de 8 KB — 50 de ellos son más de 100k
+        tokens en una única respuesta.
         """
         url = f"https://api.{_dd_site()}/api/v2/logs/events/search"
         payload = {
@@ -188,6 +181,63 @@ def register_datadog_full_tools(mcp) -> None:
         }
 
     @mcp.tool()
+    def datadog_search_logs(
+        query: str = "*",
+        hours: int = 2,
+        limit: int = 50,
+        campos: str = "",
+        max_message_chars: int = 0,
+        max_output_chars: int = _MAX_OUTPUT_CHARS,
+    ) -> dict:
+        """
+        Busca logs en Datadog y devuelve los ATRIBUTOS COMPLETOS de cada
+        evento, no solo el mensaje.
+
+        Úsala cuando necesites campos que datadog_recent_errors descarta:
+        @email, playerId, clientIp, requestHeaders, status codes, etc.
+
+        Es la tool más cara del servidor: no trunca los atributos, así que
+        un evento de WAF/ingress puede ocupar varios KB. Proyecta siempre
+        con `campos` lo que realmente necesitas — la diferencia frente a
+        traerlo todo es de uno o dos órdenes de magnitud en tokens.
+
+        Args:
+            query: query de Datadog (ej. 'service:back-security @email:x@y.com').
+            hours: ventana hacia atrás, en horas.
+            limit: máximo de eventos (tope 1000 por página en la API).
+            campos: lista separada por comas de atributos a proyectar
+                    (ej. 'playerId,http.url,network.client.ip'). Vacío = todos.
+            max_message_chars: 0 = mensaje completo. Un número > 0 lo recorta
+                    a esa cantidad de caracteres.
+            max_output_chars: presupuesto de tamaño de la respuesta. Si los
+                    eventos no caben, se devuelven los primeros que quepan y
+                    se avisa cuántos quedaron fuera (0 = sin tope).
+        """
+        salida = _buscar(query, hours, limit, campos, max_message_chars)
+        if not max_output_chars:
+            return salida
+
+        eventos = salida["eventos"]
+        acumulado = 0
+        cabida = 0
+        for evento in eventos:
+            acumulado += len(json.dumps(evento, ensure_ascii=False))
+            if acumulado > max_output_chars:
+                break
+            cabida += 1
+
+        if cabida < len(eventos):
+            salida["eventos"] = eventos[:cabida]
+            salida["eventos_devueltos"] = cabida
+            salida["eventos_omitidos"] = len(eventos) - cabida
+            salida["aviso"] = (
+                f"Respuesta recortada a ~{max_output_chars} caracteres. "
+                "Proyecta con `campos`, baja `limit` o recorta el mensaje "
+                "con `max_message_chars` para ver el resto."
+            )
+        return salida
+
+    @mcp.tool()
     def datadog_client_ips(
         query: str,
         hours: int = 24,
@@ -206,7 +256,7 @@ def register_datadog_full_tools(mcp) -> None:
             hours: ventana hacia atrás, en horas.
             limit: máximo de eventos a inspeccionar.
         """
-        crudo = datadog_search_logs(query=query, hours=hours, limit=limit)
+        crudo = _buscar(query, hours, limit, "", 0)
 
         por_ip: dict[str, dict] = {}
         sin_ip = 0
