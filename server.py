@@ -487,12 +487,16 @@ async def datadog_triggered_monitors() -> str:
         resp.raise_for_status()
         monitors = resp.json()
 
+    # El campo `message` del monitor es la plantilla de notificación
+    # (Handlebars: {{#is_alert}}, enlaces, instrucciones para el humano
+    # que recibe la alerta). No dice nada sobre POR QUÉ disparó, y son
+    # ~300 caracteres por monitor. Se omite: para saber qué está fallando
+    # bastan el nombre, el estado y los tags.
     triggered = [
         {
             "id": m["id"],
             "name": m["name"],
             "state": m.get("overall_state"),
-            "message": m.get("message", "")[:300],
             "tags": m.get("tags", []),
         }
         for m in monitors
@@ -851,11 +855,18 @@ async def azure_devops_list_projects() -> str:
 
 
 @mcp.tool()
-async def azure_repos_list_repos(project: str) -> str:
+async def azure_repos_list_repos(project: str, name_filter: Optional[str] = None) -> str:
     """Lista los repositorios Git dentro de un proyecto de Azure DevOps.
+
+    Normalmente buscas UN repo cuyo nombre ya intuyes por el nombre del
+    servicio que falló. Un proyecto como "REDCAP - NEAT" tiene ~98 repos,
+    y devolverlos todos con sus URLs cuesta unos 4.000 tokens para
+    quedarte con una línea. Filtra.
 
     Args:
         project: nombre o ID del proyecto (ver azure_devops_list_projects).
+        name_filter: si se indica, solo devuelve los repos cuyo nombre
+            contenga este texto (sin distinguir mayúsculas).
     """
     _require_azure_config()
     url = f"{_azure_base_url(project)}/git/repositories"
@@ -866,6 +877,11 @@ async def azure_repos_list_repos(project: str) -> str:
         resp.raise_for_status()
         data = resp.json()
 
+    valores = data.get("value", [])
+    if name_filter:
+        aguja = name_filter.lower()
+        valores = [r for r in valores if aguja in r.get("name", "").lower()]
+
     repos = [
         {
             "id": r["id"],
@@ -873,7 +889,7 @@ async def azure_repos_list_repos(project: str) -> str:
             "default_branch": r.get("defaultBranch"),
             "web_url": r.get("webUrl"),
         }
-        for r in data.get("value", [])
+        for r in valores
     ]
     return _dump(repos)
 
