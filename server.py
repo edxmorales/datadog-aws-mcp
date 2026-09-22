@@ -47,6 +47,7 @@ salvo que quieras usar esa fuente en particular:
 import base64
 import logging
 import os
+import re
 import sys
 import time
 import json
@@ -275,15 +276,39 @@ def _save_history(history: list) -> None:
 # Helpers
 # ---------------------------------------------------------------------------
 
+# Patrones de normalización del fingerprint, compilados una vez. Se aplican
+# en este orden: lo más específico primero, los dígitos al final.
+_RE_UUID = re.compile(
+    r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
+)
+_RE_HEX_PREFIJADO = re.compile(r"\b0x[0-9a-fA-F]+\b")
+_RE_HEX_LARGO = re.compile(r"\b[0-9a-fA-F]{16,}\b")
+_RE_DIGITOS = re.compile(r"\d+")
+
+
 def _fingerprint(message: str) -> str:
     """Genera una huella simple para agrupar errores similares.
 
     Quita números, IDs y rutas variables para que el mismo tipo de error
     con datos distintos (ej. distinto user_id) agrupe igual.
+
+    El orden importa. Antes se sustituían los dígitos PRIMERO y el hex
+    después, así que para cuando corría la regla de `0x...` ya no quedaba
+    ningún `0x` que encontrar: era código muerto. Y nada cubría los
+    identificadores hex sin prefijo, que son los que de verdad aparecen:
+    el `xRequestId` de Gamanza es hex de 32 caracteres, así que 1000
+    eventos del mismo error producían 1000 huellas distintas y la
+    agrupación no servía para nada.
+
+    El umbral de 16 caracteres para el hex sin prefijo es deliberado:
+    evita tragarse palabras que casualmente solo usan letras a-f, como
+    "facade", "deadbeef" o "accede".
     """
-    import re
-    normalized = re.sub(r"\d+", "#", message)
-    normalized = re.sub(r"0x[0-9a-fA-F]+", "0x#", normalized)
+    normalized = _RE_UUID.sub("<uuid>", message)
+    normalized = _RE_HEX_PREFIJADO.sub("<hex>", normalized)
+    normalized = _RE_HEX_LARGO.sub("<hex>", normalized)
+    normalized = _RE_DIGITOS.sub("#", normalized)
     normalized = normalized.strip().lower()
     return hashlib.sha1(normalized.encode()).hexdigest()[:12]
 
@@ -1347,7 +1372,18 @@ def check_known_incident(fingerprint: str) -> str:
             find_recurring_errors).
     """
     history = _load_history()
-    matches = [inc for inc in history if inc.get("fingerprint") == fingerprint]
+    # También se busca en fingerprint_aliases. Cuando la normalización de
+    # _fingerprint cambia, el mismo error pasa a tener otra huella y el
+    # historial acumulado quedaría huérfano — y no se puede recalcular,
+    # porque las entradas guardan el resumen del error, nunca el mensaje
+    # crudo del que salió el hash. Los alias son la forma de que una
+    # entrada vieja siga encontrándose con la huella nueva.
+    matches = [
+        inc
+        for inc in history
+        if inc.get("fingerprint") == fingerprint
+        or fingerprint in (inc.get("fingerprint_aliases") or [])
+    ]
     if not matches:
         return _dump({"found": False, "message": "Sin incidentes previos con este fingerprint."})
     return _dump({"found": True, "incidents": matches})

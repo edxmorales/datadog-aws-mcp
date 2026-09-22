@@ -175,6 +175,67 @@ def test_fingerprint_no_colapsa_palabras_normales():
     )
 
 
+def test_fingerprint_estable_sin_identificadores_hex():
+    """Compatibilidad hacia atrás con el historial ya registrado.
+
+    El historial guarda huellas calculadas con la función vieja y NO
+    guarda el mensaje crudo, así que no se pueden recalcular. Un mensaje
+    sin UUIDs ni hex largo debe seguir dando la misma huella que antes,
+    o las entradas viejas quedan huérfanas.
+
+    El caso concreto: el error de Gamanza registrado como d93adc920006.
+    Verificado contra 200 eventos reales de Datadog — misma huella con la
+    función vieja y con la nueva.
+    """
+    import hashlib
+    import re
+    import server
+
+    def fingerprint_viejo(message: str) -> str:
+        n = re.sub(r"\d+", "#", message)
+        n = re.sub(r"0x[0-9a-fA-F]+", "0x#", n)
+        return hashlib.sha1(n.strip().lower().encode()).hexdigest()[:12]
+
+    mensajes = [
+        "Error processing message: Request failed with status code 401",
+        "AxiosError: Request failed with status code 401\n    at settle "
+        "(/app/node_modules/axios/dist/node/axios.cjs:2216:12)",
+        "Connection refused to database replica on port 5432",
+    ]
+    for m in mensajes:
+        check(
+            f"huella estable para: {m[:45]}...",
+            server._fingerprint(m) == fingerprint_viejo(m),
+            "la normalización nueva rompió una huella ya registrada",
+        )
+
+
+def test_check_known_incident_encuentra_por_alias():
+    import server
+
+    entradas = [
+        {
+            "fingerprint": "huellanueva01",
+            "fingerprint_aliases": ["huellavieja99"],
+            "error_summary": "Incidente migrado",
+        }
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        ruta = Path(tmp) / "hist.json"
+        original = server.INCIDENT_HISTORY_PATH
+        try:
+            server.INCIDENT_HISTORY_PATH = ruta
+            server._save_history(entradas)
+            por_alias = json.loads(server.check_known_incident("huellavieja99"))
+            por_actual = json.loads(server.check_known_incident("huellanueva01"))
+            ausente = json.loads(server.check_known_incident("noexiste"))
+            check("check_known_incident encuentra por alias", por_alias["found"])
+            check("check_known_incident encuentra por huella actual", por_actual["found"])
+            check("check_known_incident no inventa coincidencias", not ausente["found"])
+        finally:
+            server.INCIDENT_HISTORY_PATH = original
+
+
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).parent))
     for prueba in [
@@ -185,6 +246,8 @@ if __name__ == "__main__":
         test_fingerprint_agrupa_pese_al_request_id,
         test_fingerprint_sigue_separando_errores_distintos,
         test_fingerprint_no_colapsa_palabras_normales,
+        test_fingerprint_estable_sin_identificadores_hex,
+        test_check_known_incident_encuentra_por_alias,
     ]:
         try:
             prueba()
