@@ -236,16 +236,39 @@ def _recortar_archivo(
 
 
 def _load_history() -> list:
+    """Lee el historial de incidentes, siempre como UTF-8.
+
+    Sin `encoding` explícito, read_text() usa el del locale: cp1252 en
+    Windows, UTF-8 en Linux. El historial se escribió en una máquina
+    Windows, así que en un contenedor esto lanzaba UnicodeDecodeError —
+    que no es JSONDecodeError ni OSError, y por tanto no lo capturaba el
+    except de abajo. La memoria de incidentes reventaba justo donde más
+    falta hace.
+    """
     if not INCIDENT_HISTORY_PATH.exists():
         return []
     try:
-        return json.loads(INCIDENT_HISTORY_PATH.read_text())
-    except (json.JSONDecodeError, OSError):
+        crudo = INCIDENT_HISTORY_PATH.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        # Historial escrito antes de fijar el encoding. Se recupera con el
+        # encoding viejo en vez de perderlo; el próximo _save_history lo
+        # deja ya en UTF-8.
+        try:
+            crudo = INCIDENT_HISTORY_PATH.read_text(encoding="cp1252")
+        except (UnicodeDecodeError, OSError):
+            return []
+    except OSError:
+        return []
+    try:
+        return json.loads(crudo)
+    except json.JSONDecodeError:
         return []
 
 
 def _save_history(history: list) -> None:
-    INCIDENT_HISTORY_PATH.write_text(json.dumps(history, indent=2, ensure_ascii=False))
+    INCIDENT_HISTORY_PATH.write_text(
+        json.dumps(history, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
 
 
 # ---------------------------------------------------------------------------
