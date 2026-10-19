@@ -1,0 +1,10 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "datadog-aws-integration": {
+      "type": "local",
+      "command": ["python", "C:/ruta/a/datadog-aws-mcp/server.py"],
+      "enabled": true
+    }
+  }
+}

@@ -22,6 +22,18 @@ capacidades normales de git (crear rama, editar código, commit, push,
 abrir PR) para proponer un fix — con revisión humana antes de mergear
 o desplegar.
 
+## Documentación
+
+- [docs/MCP.md](docs/MCP.md): arquitectura, variables de entorno por fuente,
+  lista de herramientas, configuración para OpenCode y Claude, pruebas y
+  limitaciones conocidas.
+- `tools_opencode.py`: implementación de `analizar_codigo_opencode`
+  (análisis de código con OpenCode sobre repos locales).
+- `AGENTS.md`: instrucciones para agentes (OpenCode y similares) que
+  trabajen en este repo.
+- `opencode.example.json`: ejemplo de configuración de OpenCode para usar
+  este MCP.
+
 ## Instalación
 
 ```bash

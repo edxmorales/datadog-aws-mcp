@@ -69,6 +69,8 @@ from mcp.server.fastmcp import FastMCP
 #   tools_datadog_full -> API v2 de Datadog con atributos completos
 from tools_waf import register_waf_tools
 from tools_datadog_full import register_datadog_full_tools
+# tools_opencode     -> análisis de código con OpenCode (agente sobre repos locales)
+from tools_opencode import register_opencode_tools
 
 load_dotenv()
 
@@ -1459,6 +1461,7 @@ def list_incident_history(resolution_type: Optional[str] = None, limit: int = 50
 # ---------------------------------------------------------------------------
 register_waf_tools(mcp)
 register_datadog_full_tools(mcp)
+register_opencode_tools(mcp)
 
 if __name__ == "__main__":
     logger.info(
