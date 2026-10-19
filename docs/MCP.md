@@ -108,3 +108,23 @@ Windows, script con shebang en Linux/macOS); no necesita OpenCode real.
   confirmes o descartes esos cambios.
 - Hay que tener cuidado con los repos privados: la URL y el código pasan por
   OpenCode, que usa el proveedor de modelo configurado en OpenCode.
+
+## Cambios recientes
+
+- **OpenCode puede clonar y actualizar repos.** `analizar_codigo_opencode`
+  acepta una URL de GitHub o Azure Repos en `repo`. Clona si falta y hace
+  `git pull --ff-only` si ya existe. Los repos con cambios locales no se tocan.
+- **Nombres de repo ambiguos.** Con `OPENCODE_REPOS_DIR=C:\Proyectos`, un nombre
+  como `datadog-aws-mcp` puede apuntar a una carpeta contenedora que no es un
+  repo git. Usa la ruta completa relativa (`datadog-aws-mcp\datadog-aws-mcp`) o
+  la URL.
+- **Carpetas sin rastrear bloquean la actualización.** Si dentro del repo hay
+  archivos sin confirmar (por ejemplo `Claude outputs/`), la herramienta no
+  hace `git pull` y lo indica en `actualizacion`. Muévelos fuera del repo o
+  agrégalos a `.gitignore`.
+- **Variables de OpenCode.** `OPENCODE_REPOS_DIR` (obligatoria),
+  `OPENCODE_BIN`, `OPENCODE_MODEL`, `OPENCODE_TIMEOUT_S` y
+  `OPENCODE_MAX_OUTPUT_CHARS` van en `.env`, o en el bloque `env` de la
+  configuración de Claude.
+- **Instalación guiada.** Para montar el MCP con ayuda de cualquier IA, usa
+  [PROMPT_INSTALL.md](../PROMPT_INSTALL.md).

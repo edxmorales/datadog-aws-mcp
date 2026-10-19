@@ -13,7 +13,8 @@
         "AZURE_DEVOPS_PAT": "tu_personal_access_token (opcional)",
         "AZURE_DEVOPS_API_VERSION": "7.1",
         "GITHUB_TOKEN": "tu_personal_access_token (opcional)",
-        "GITHUB_API_URL": "https://api.github.com"
+        "GITHUB_API_URL": "https://api.github.com",
+        "OPENCODE_REPOS_DIR": "/ruta/a/la/carpeta/con/tus/repos (opcional, para analizar_codigo_opencode)"
       }
     }
   }

@@ -24,6 +24,8 @@ o desplegar.
 
 ## Documentación
 
+- [PROMPT_INSTALL.md](PROMPT_INSTALL.md): prompt para que cualquier IA te guíe
+  en la instalación y configuración según las fuentes que elijas.
 - [docs/MCP.md](docs/MCP.md): arquitectura, variables de entorno por fuente,
   lista de herramientas, configuración para OpenCode y Claude, pruebas y
   limitaciones conocidas.
