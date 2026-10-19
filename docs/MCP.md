@@ -50,7 +50,21 @@ Ver `.env.example` (nunca subas `.env`).
 ### analizar_codigo_opencode
 
 Ejecuta `opencode run` con el repo como directorio de trabajo y devuelve un
-JSON con `answer`, `repo`, `model` y `truncated`. Salvaguardas: el repo debe
+JSON con `answer`, `repo`, `model`, `actualizacion` y `truncated`.
+
+`repo` acepta dos formas:
+
+- **Nombre de carpeta** ya existente dentro de `OPENCODE_REPOS_DIR` (ej. `Sentinel`).
+- **URL https** de GitHub o Azure Repos. Si la carpeta no existe, se clona
+  (`--depth 1`, o la rama indicada en `rama`). Si ya existe, se actualiza con
+  `git pull --ff-only` antes de analizar, así que siempre usa la última versión.
+  Un repo con cambios locales sin confirmar **no se toca**: se analiza tal cual
+  y `actualizacion` lo indica. `actualizar=false` omite la actualización.
+
+La autenticación usa `GITHUB_TOKEN` o `AZURE_DEVOPS_PAT` pasados como cabecera
+de git por variables de entorno: el token nunca va en la URL, en los argumentos
+ni en `.git/config`. Solo se aceptan hosts de GitHub y Azure Repos, y URLs sin
+credenciales. Salvaguardas: el repo debe
 estar dentro de `OPENCODE_REPOS_DIR`; `subprocess` sin shell y con el prompt
 por stdin; timeout (`timeout_s` o `OPENCODE_TIMEOUT_S`, tope 1800 s); salida
 recortada a `OPENCODE_MAX_OUTPUT_CHARS`; y la guardia `OPENCODE_MCP_NESTED`,
@@ -87,3 +101,10 @@ Windows, script con shebang en Linux/macOS); no necesita OpenCode real.
   por el MCP: limita sus permisos en su propia configuración.
 - Un solo proceso por llamada, sin cola ni límite de concurrencia.
 - La respuesta se recorta a `OPENCODE_MAX_OUTPUT_CHARS`.
+- Clonar o actualizar necesita `git` en el PATH y acceso de red al remoto.
+- El clon superficial (`--depth 1`) no tiene historial: `git log` y `git blame`
+  no mostrarán commits anteriores.
+- Un repo con cambios locales queda como está; no se actualiza hasta que
+  confirmes o descartes esos cambios.
+- Hay que tener cuidado con los repos privados: la URL y el código pasan por
+  OpenCode, que usa el proveedor de modelo configurado en OpenCode.

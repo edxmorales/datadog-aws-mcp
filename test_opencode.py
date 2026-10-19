@@ -164,11 +164,106 @@ async def correr(tmp: Path):
     check("exige OPENCODE_REPOS_DIR", not ok and "OPENCODE_REPOS_DIR" in txt, txt)
 
 
+def git(cwd, *args):
+    import subprocess
+
+    r = subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", *args],
+        cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+    )
+    if r.returncode != 0:
+        raise RuntimeError(f"git {args} falló: {r.stderr}")
+    return r.stdout.strip()
+
+
+async def correr_git(tmp: Path):
+    """Clonado y actualización a la última versión, con un remoto local real."""
+    import tools_opencode
+
+    remoto = tmp / "remoto.git"
+    trabajo = tmp / "trabajo"
+    repos = tmp / "repos_git"
+    repos.mkdir()
+    git(tmp, "init", "--bare", "-b", "main", str(remoto))
+    git(tmp, "clone", str(remoto), str(trabajo))
+    (trabajo / "a.txt").write_text("v1", encoding="utf-8")
+    git(trabajo, "add", ".")
+    git(trabajo, "commit", "-m", "v1")
+    git(trabajo, "push", "origin", "HEAD:main")
+
+    exe = crear_opencode_falso(tmp)
+    os.environ.update({
+        "OPENCODE_REPOS_DIR": str(repos), "OPENCODE_BIN": str(exe), "FAKE_MODE": "ok",
+    })
+    os.environ.pop("OPENCODE_MODEL", None)
+    m = construir_tool()
+
+    # Parseo de URLs (sin red).
+    pu = tools_opencode._parse_repo_url
+    check("URL de GitHub deriva el nombre", pu("https://github.com/org/mi-repo.git/") == ("https://github.com/org/mi-repo", "mi-repo"))
+    check("URL de Azure deriva el nombre", pu("https://dev.azure.com/o/p/_git/api")[1] == "api")
+    check("un nombre simple no es URL", pu("mi-repo") is None)
+    for malo in ["http://github.com/o/r", "https://evil.com/o/r", "https://u:p@github.com/o/r",
+                 "file:///c:/x", "https://github.com/o/.."]:
+        try:
+            pu(malo)
+            check(f"rechaza URL {malo}", False)
+        except ValueError:
+            check(f"rechaza URL {malo}", True)
+
+    # Clonado (se parchea el parseo para apuntar al remoto local).
+    original = tools_opencode._parse_repo_url
+    tools_opencode._parse_repo_url = lambda r: (str(remoto), "clon") if r == "URL-FALSA" else original(r)
+    try:
+        ok, txt = await llamar(m, repo="URL-FALSA", pregunta="x")
+        check("clona si no existe", ok and json.loads(txt)["actualizacion"] == "clonado", txt)
+        check("el clon tiene los archivos", (repos / "clon" / "a.txt").exists())
+
+        # Llega un commit nuevo al remoto: se debe traer.
+        (trabajo / "a.txt").write_text("v2", encoding="utf-8")
+        git(trabajo, "commit", "-am", "v2")
+        git(trabajo, "push", "origin", "HEAD:main")
+        ok, txt = await llamar(m, repo="URL-FALSA", pregunta="x")
+        check("actualiza a la última versión", ok and json.loads(txt)["actualizacion"] == "actualizada", txt)
+        check("el contenido es el nuevo", (repos / "clon" / "a.txt").read_text(encoding="utf-8") == "v2")
+
+        ok, txt = await llamar(m, repo="URL-FALSA", pregunta="x")
+        check("sin novedades dice que está al día", ok and json.loads(txt)["actualizacion"] == "ya estaba al día", txt)
+
+        # Cambios locales: no se tocan.
+        (repos / "clon" / "a.txt").write_text("mio", encoding="utf-8")
+        (trabajo / "b.txt").write_text("nuevo", encoding="utf-8")
+        git(trabajo, "add", ".")
+        git(trabajo, "commit", "-m", "v3")
+        git(trabajo, "push", "origin", "HEAD:main")
+        ok, txt = await llamar(m, repo="clon", pregunta="x")
+        check("no pisa cambios locales", ok and "cambios locales" in json.loads(txt)["actualizacion"], txt)
+        check("conserva el archivo editado", (repos / "clon" / "a.txt").read_text(encoding="utf-8") == "mio")
+        check("no trajo el commit nuevo", not (repos / "clon" / "b.txt").exists())
+
+        # actualizar=false.
+        ok, txt = await llamar(m, repo="clon", pregunta="x", actualizar=False)
+        check("respeta actualizar=false", ok and "omitida" in json.loads(txt)["actualizacion"], txt)
+
+        # Clonado fallido es un error claro.
+        tools_opencode._parse_repo_url = lambda r: (str(tmp / "no-existe.git"), "roto") if r == "URL-ROTA" else original(r)
+        ok, txt = await llamar(m, repo="URL-ROTA", pregunta="x")
+        check("clonado fallido da error", not ok and "No se pudo clonar" in txt, txt)
+    finally:
+        tools_opencode._parse_repo_url = original
+
+    # Rama inválida.
+    ok, txt = await llamar(m, repo="clon", pregunta="x", rama="--upload-pack=x")
+    check("rechaza rama sospechosa", not ok and "Nombre de rama inválido" in txt, txt)
+
+
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).parent))
     try:
         with tempfile.TemporaryDirectory() as tmp:
             asyncio.run(correr(Path(tmp)))
+        with tempfile.TemporaryDirectory() as tmp:
+            asyncio.run(correr_git(Path(tmp)))
     except Exception as e:
         print(f"FALLA test_opencode -- excepción: {type(e).__name__}: {e}")
         FALLOS.append("test_opencode")
